@@ -7,6 +7,31 @@ export function signWebhookPayload(secret: string, body: string): string {
   return `sha256=${hmac}`;
 }
 
+function timingSafeEqualStrings(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, "utf8");
+  const bufB = Buffer.from(b, "utf8");
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+export function verifyGitHubWebhookSignature(
+  secret: string,
+  rawBody: string,
+  signatureHeader: string | null | undefined,
+): boolean {
+  if (!secret || !signatureHeader) return false;
+  const expected = signWebhookPayload(secret, rawBody);
+  return timingSafeEqualStrings(expected, signatureHeader.trim());
+}
+
+export function verifyGitLabWebhookToken(
+  secret: string,
+  tokenHeader: string | null | undefined,
+): boolean {
+  if (!secret || !tokenHeader) return false;
+  return timingSafeEqualStrings(secret, tokenHeader.trim());
+}
+
 export class WebhookDispatcher {
   private readonly store: Store;
   private readonly fetchImpl: typeof fetch;

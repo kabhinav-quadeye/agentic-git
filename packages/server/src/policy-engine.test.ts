@@ -157,6 +157,20 @@ describe("evaluateMergeGate", () => {
     expect(res.canMerge).toBe(false);
     expect(res.approvals.approvedHandles).toEqual([]);
   });
+
+  it("ignores self-approval by the PR author by default", () => {
+    const policy = { ...DEFAULT_MERGE_POLICY, minApprovals: 1 };
+    const res = evaluateMergeGate({
+      pr: makePr({ authorHandle: "coder-agent" }),
+      policy,
+      reviews: [makeReview("coder-agent", "approved")],
+      comments: [],
+      commentTypes: BUILTIN_COMMENT_TYPES,
+    });
+    expect(res.canMerge).toBe(false);
+    expect(res.approvals.approvedHandles).toEqual([]);
+    expect(res.reasons.some((r) => /need at least 1 approval/i.test(r))).toBe(true);
+  });
 });
 
 describe("filterDiffFiles", () => {
@@ -231,5 +245,21 @@ describe("filterDiffFiles", () => {
     });
     expect(withOverride.visibleFiles).toHaveLength(3);
     expect(withOverride.hiddenFiles).toHaveLength(2);
+  });
+
+  it("un-hides agent-approved files when a newer commit is pushed after the agent approved", () => {
+    const afterNewPush = filterDiffFiles({
+      pr: makePr({ headSha: "sha_head_2" }),
+      files,
+      rules,
+      viewer: { handle: "alice", type: "human" },
+      reviews: [makeReview("test-review-agent", "approved", "sha_head_1")],
+    });
+    expect(afterNewPush.visibleFiles.map((f) => f.path)).toEqual([
+      "src/billing.ts",
+      "src/billing.test.ts",
+      "src/__tests__/edge.spec.ts",
+    ]);
+    expect(afterNewPush.hiddenFiles).toHaveLength(0);
   });
 });

@@ -105,6 +105,9 @@ export const BUILTIN_COMMENT_TYPES: CommentTypeDefinition[] = [
   },
 ];
 
+export const MergeMethodSchema = z.enum(["merge", "squash", "rebase"]);
+export type MergeMethod = z.infer<typeof MergeMethodSchema>;
+
 export const MergePolicySchema = z.object({
   requireCiPassed: z.boolean().default(true),
   requiredChecks: z.array(z.string()).default([]),
@@ -113,6 +116,9 @@ export const MergePolicySchema = z.object({
   anyOfApprovalGroups: z.array(z.array(z.string())).default([]),
   blockOnErrorFindings: z.boolean().default(true),
   invalidateApprovalsOnPush: z.boolean().default(false),
+  allowSelfApproval: z.boolean().default(false),
+  allowAuthorResolveBlocking: z.boolean().default(false),
+  mergeMethod: MergeMethodSchema.default("squash"),
   defaultAutoMerge: z.boolean().default(false),
 });
 export type MergePolicy = z.infer<typeof MergePolicySchema>;
@@ -156,6 +162,7 @@ export const CreateRepoInputSchema = z.object({
   upstreamRepo: z.string().min(1),
   upstreamGitUrl: z.string().min(1),
   upstreamToken: z.string().default(""),
+  incomingWebhookSecret: z.string().default(""),
   defaultBranch: z.string().default("main"),
   credentialMode: CredentialModeSchema.default("service"),
   protectedBranches: z.array(z.string()).default(["main", "master"]),

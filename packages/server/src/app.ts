@@ -13,8 +13,10 @@ import {
   CreateWebhookInputSchema,
   DiffFilterRuleSchema,
   InvokeAgentInputSchema,
+  MergeMethodSchema,
   MergePolicySchema,
   type CiCheck,
+  type MergeMethod,
   type PullRequest,
 } from "@agentic-git/shared";
 import { z } from "zod";
@@ -24,16 +26,19 @@ import {
   resolveUpstreamToken,
 } from "./auth.js";
 import { Store, type ActorRowInternal, type RepoRowInternal } from "./db.js";
-import { ForgeRegistry } from "./forges/index.js";
+import { ForgeRegistry, MergeConflictError } from "./forges/index.js";
 import {
   buildReceivePackRejectResponse,
   buildUpstreamGitAuthHeader,
   parseReceivePack,
+  parseReceivePackResult,
 } from "./git-protocol.js";
 import { evaluateMergeGate, filterDiffFiles } from "./policy-engine.js";
 import {
   parseGitHubCiWebhook,
   parseGitLabCiWebhook,
+  verifyGitHubWebhookSignature,
+  verifyGitLabWebhookToken,
   WebhookDispatcher,
 } from "./webhooks.js";
 
@@ -86,6 +91,7 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
     pr: PullRequest,
     actor: ActorRowInternal,
     force = false,
+    mergeMethod?: MergeMethod,
   ): Promise<{ pr: PullRequest; mergedSha: string; autoMerged: boolean }> {
     const comments = store.listComments(pr.id, repo);
     const reviews = store.listReviews(pr.id);
@@ -112,6 +118,7 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
       sourceBranch: pr.sourceBranch,
       targetBranch: pr.targetBranch,
       commitTitle: `${pr.title} (#${pr.number})`,
+      mergeMethod: mergeMethod ?? repo.mergePolicy.mergeMethod,
     });
 
     const updated = store.markPrMerged(pr.id, actor.id);
@@ -123,6 +130,20 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
     });
 
     return { pr: updated, mergedSha, autoMerged: false };
+  }
+
+  function isMergeCapable(actor: ActorRowInternal | null): boolean {
+    return Boolean(actor && (actor.canMerge || actor.role === "admin" || actor.role === "maintainer"));
+  }
+
+  function resolveAutoMergeActor(pr: PullRequest): ActorRowInternal {
+    const author = store.getActorById(pr.authorActorId);
+    if (author && isMergeCapable(author)) return author;
+    if (author?.ownerId) {
+      const owner = store.getActorById(author.ownerId);
+      if (owner && isMergeCapable(owner)) return owner;
+    }
+    return store.getActorByHandle("admin")!;
   }
 
   async function maybeAutoMerge(
@@ -267,26 +288,33 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
 
     const resBody = await upstreamRes.arrayBuffer();
 
-    // Post-push hook: sync open PR headShas & notify external agentic apps
+    // Post-push hook: sync open PR headShas & notify external agentic apps ONLY for refs upstream accepted
     if (isReceivePack && upstreamRes.ok && parsedCommands.length > 0) {
-      const owner = actor.ownerId ? store.getActorById(actor.ownerId) : null;
-      for (const cmd of parsedCommands) {
-        if (!cmd.ref.startsWith("refs/heads/") || /^0+$/.test(cmd.newSha)) continue;
-        const branch = cmd.ref.slice("refs/heads/".length);
-        const openPrs = store.findOpenPrsBySourceBranch(repo.id, branch);
-        for (const openPr of openPrs) {
-          const updatedPr = store.updatePrHeadSha(openPr.id, cmd.newSha);
-          await webhooks.emit(repo.id, "pr.updated", {
-            repo: store.stripRepoInternal(repo),
-            pr: updatedPr,
-            push: {
-              ref: cmd.ref,
-              oldSha: cmd.oldSha,
-              newSha: cmd.newSha,
-              actor: store.stripActorInternal(actor),
-              ownerHandle: owner?.handle ?? null,
-            },
-          });
+      const pushResult = parseReceivePackResult(new Uint8Array(resBody));
+      if (pushResult.unpackOk) {
+        const owner = actor.ownerId ? store.getActorById(actor.ownerId) : null;
+        for (const cmd of parsedCommands) {
+          if (!cmd.ref.startsWith("refs/heads/") || /^0+$/.test(cmd.newSha)) continue;
+          const refOutcome = pushResult.refs.get(cmd.ref);
+          if (refOutcome && !refOutcome.ok) continue;
+          // If upstream sent explicit report-status lines and didn't confirm this ref as ok, skip
+          if (pushResult.refs.size > 0 && !refOutcome?.ok) continue;
+          const branch = cmd.ref.slice("refs/heads/".length);
+          const openPrs = store.findOpenPrsBySourceBranch(repo.id, branch);
+          for (const openPr of openPrs) {
+            const updatedPr = store.updatePrHeadSha(openPr.id, cmd.newSha);
+            await webhooks.emit(repo.id, "pr.updated", {
+              repo: store.stripRepoInternal(repo),
+              pr: updatedPr,
+              push: {
+                ref: cmd.ref,
+                oldSha: cmd.oldSha,
+                newSha: cmd.newSha,
+                actor: store.stripActorInternal(actor),
+                ownerHandle: owner?.handle ?? null,
+              },
+            });
+          }
         }
       }
     }
@@ -309,14 +337,39 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
 
   app.post("/api/incoming-webhooks/github", async (c) => {
     const eventName = c.req.header("x-github-event") ?? "";
-    const body = (await c.req.json()) as Record<string, unknown>;
-    const parsed = parseGitHubCiWebhook(eventName, body);
-    if (!parsed) return c.json({ ok: true, ignored: true });
+    const sigHeader = c.req.header("x-hub-signature-256") ?? "";
+    const rawBody = await c.req.text();
+    let body: Record<string, unknown>;
+    try {
+      body = JSON.parse(rawBody) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: "Invalid JSON payload" }, 400);
+    }
 
+    const parsed = parseGitHubCiWebhook(eventName, body);
+    const repoObj = body.repository as { full_name?: string } | undefined;
+    const upstreamRepoName = parsed?.upstreamRepo ?? repoObj?.full_name ?? "";
     const matchedRepos = store
       .listRepos()
       .map((r) => store.getRepoById(r.id)!)
-      .filter((r) => r.forgeType === "github" && r.upstreamRepo === parsed.upstreamRepo);
+      .filter((r) => r.forgeType === "github" && r.upstreamRepo === upstreamRepoName);
+
+    const envSecret = process.env.AGIT_INCOMING_WEBHOOK_SECRET ?? "";
+    if (matchedRepos.length === 0) {
+      if (!envSecret || !verifyGitHubWebhookSignature(envSecret, rawBody, sigHeader)) {
+        return c.json({ error: "Invalid or missing GitHub webhook signature" }, 401);
+      }
+      return c.json({ ok: true, ignored: true });
+    }
+
+    for (const repo of matchedRepos) {
+      const secret = repo.incomingWebhookSecret || envSecret;
+      if (!verifyGitHubWebhookSignature(secret, rawBody, sigHeader)) {
+        return c.json({ error: "Invalid or missing GitHub webhook signature" }, 401);
+      }
+    }
+
+    if (!parsed) return c.json({ ok: true, ignored: true });
 
     const updatedPrs: PullRequest[] = [];
     for (const repo of matchedRepos) {
@@ -329,8 +382,8 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
           pr: updated,
           checks: mergedChecks,
         });
-        const admin = store.getActorById(pr.authorActorId) ?? store.getActorByHandle("admin")!;
-        const auto = await maybeAutoMerge(repo, pr.id, admin);
+        const mergeActor = resolveAutoMergeActor(pr);
+        const auto = await maybeAutoMerge(repo, pr.id, mergeActor);
         updatedPrs.push(auto.pr);
       }
     }
@@ -338,14 +391,39 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
   });
 
   app.post("/api/incoming-webhooks/gitlab", async (c) => {
-    const body = (await c.req.json()) as Record<string, unknown>;
-    const parsed = parseGitLabCiWebhook(body);
-    if (!parsed) return c.json({ ok: true, ignored: true });
+    const tokenHeader = c.req.header("x-gitlab-token") ?? "";
+    const rawBody = await c.req.text();
+    let body: Record<string, unknown>;
+    try {
+      body = JSON.parse(rawBody) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: "Invalid JSON payload" }, 400);
+    }
 
+    const parsed = parseGitLabCiWebhook(body);
+    const projectObj = body.project as { path_with_namespace?: string } | undefined;
+    const upstreamRepoName = parsed?.upstreamRepo ?? projectObj?.path_with_namespace ?? "";
     const matchedRepos = store
       .listRepos()
       .map((r) => store.getRepoById(r.id)!)
-      .filter((r) => r.forgeType === "gitlab" && r.upstreamRepo === parsed.upstreamRepo);
+      .filter((r) => r.forgeType === "gitlab" && r.upstreamRepo === upstreamRepoName);
+
+    const envSecret = process.env.AGIT_INCOMING_WEBHOOK_SECRET ?? "";
+    if (matchedRepos.length === 0) {
+      if (!envSecret || !verifyGitLabWebhookToken(envSecret, tokenHeader)) {
+        return c.json({ error: "Invalid or missing GitLab webhook token" }, 401);
+      }
+      return c.json({ ok: true, ignored: true });
+    }
+
+    for (const repo of matchedRepos) {
+      const secret = repo.incomingWebhookSecret || envSecret;
+      if (!verifyGitLabWebhookToken(secret, tokenHeader)) {
+        return c.json({ error: "Invalid or missing GitLab webhook token" }, 401);
+      }
+    }
+
+    if (!parsed) return c.json({ ok: true, ignored: true });
 
     const updatedPrs: PullRequest[] = [];
     for (const repo of matchedRepos) {
@@ -358,8 +436,8 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
           pr: updated,
           checks: mergedChecks,
         });
-        const admin = store.getActorById(pr.authorActorId) ?? store.getActorByHandle("admin")!;
-        const auto = await maybeAutoMerge(repo, pr.id, admin);
+        const mergeActor = resolveAutoMergeActor(pr);
+        const auto = await maybeAutoMerge(repo, pr.id, mergeActor);
         updatedPrs.push(auto.pr);
       }
     }
@@ -502,6 +580,7 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
       customCommentTypes: z.array(CommentTypeDefinitionSchema).optional(),
       credentialMode: z.enum(["service", "per_user"]).optional(),
       upstreamToken: z.string().optional(),
+      incomingWebhookSecret: z.string().optional(),
     });
     const parsed = PatchSchema.safeParse(await c.req.json());
     if (!parsed.success) {
@@ -517,6 +596,7 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
       customCommentTypes: parsed.data.customCommentTypes,
       credentialMode: parsed.data.credentialMode,
       upstreamToken: parsed.data.upstreamToken,
+      incomingWebhookSecret: parsed.data.incomingWebhookSecret,
     });
     return c.json({
       repo: updated,
@@ -594,6 +674,20 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
     }
     const data = parsed.data;
     const targetBranch = data.targetBranch ?? repo.defaultBranch;
+
+    const existingOpen = store
+      .findOpenPrsBySourceBranch(repo.id, data.sourceBranch)
+      .find((p) => p.targetBranch === targetBranch);
+    if (existingOpen) {
+      return c.json(
+        {
+          error: `An open pull request (#${existingOpen.number}) already exists for '${data.sourceBranch}' -> '${targetBranch}'`,
+          existingPr: existingOpen,
+        },
+        409,
+      );
+    }
+
     const upstreamToken = resolveUpstreamToken(store, repo, caller);
     const adapter = forges.get(repo.forgeType);
 
@@ -683,6 +777,38 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
     return c.json({ pr: auto.pr, autoMerged: auto.autoMerged, mergedSha: auto.mergedSha });
   });
 
+  app.post("/api/repos/:org/:repo/prs/:number/close", async (c) => {
+    const caller = c.get("actor");
+    const slug = `${c.req.param("org")}/${c.req.param("repo")}`;
+    const repo = store.getRepoBySlug(slug);
+    if (!repo) return c.json({ error: `Repo '${slug}' not found` }, 404);
+    const num = Number.parseInt(c.req.param("number"), 10);
+    const pr = store.getPrByNumber(repo.id, num);
+    if (!pr) return c.json({ error: `PR #${num} not found` }, 404);
+
+    if (pr.status === "merged") {
+      return c.json({ error: `PR #${num} is already merged and cannot be closed` }, 409);
+    }
+    if (pr.status === "closed") {
+      return c.json({ pr });
+    }
+
+    if (pr.upstreamPrId) {
+      const upstreamToken = resolveUpstreamToken(store, repo, caller);
+      const adapter = forges.get(repo.forgeType);
+      await adapter.closeShadowPr(repo, upstreamToken, pr.upstreamPrId);
+    }
+
+    const closed = store.markPrClosed(pr.id);
+    await webhooks.emit(repo.id, "pr.closed", {
+      repo: store.stripRepoInternal(repo),
+      pr: closed,
+      closedBy: store.stripActorInternal(caller),
+    });
+
+    return c.json({ pr: closed });
+  });
+
   // ---- Agent-Aware Filtered Diff ----
 
   app.get("/api/repos/:org/:repo/prs/:number/diff", async (c) => {
@@ -695,11 +821,12 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
     if (!pr) return c.json({ error: `PR #${num} not found` }, 404);
 
     const includeHidden = c.req.query("includeHidden") === "true";
-    const cacheKey = `${pr.targetBranch}:${pr.headSha}`;
+    const upstreamToken = resolveUpstreamToken(store, repo, viewer);
+    const adapter = forges.get(repo.forgeType);
+    const targetSha = await adapter.getBranchHeadSha(repo, upstreamToken, pr.targetBranch).catch(() => null);
+    const cacheKey = `${pr.targetBranch}@${targetSha ?? "tip"}:${pr.headSha}`;
     let files = store.getCachedDiff(repo.id, cacheKey);
     if (!files) {
-      const upstreamToken = resolveUpstreamToken(store, repo, viewer);
-      const adapter = forges.get(repo.forgeType);
       files = await adapter.getPrDiff(repo, upstreamToken, {
         upstreamPrId: pr.upstreamPrId,
         sourceBranch: pr.sourceBranch,
@@ -792,6 +919,36 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
     const pr = store.getPrById(comment.prId)!;
     const repo = store.getRepoById(pr.repoId)!;
 
+    const typeDef = store.getAllCommentTypes(repo).find((t) => t.key === comment.commentType);
+    const isBlocking =
+      Boolean(typeDef?.blocksMerge) ||
+      (repo.mergePolicy.blockOnErrorFindings &&
+        comment.commentType === "agent_finding" &&
+        comment.severity === "error");
+
+    if (isBlocking) {
+      if (caller.type === "agent" && comment.authorType === "human") {
+        return c.json(
+          {
+            error: `Agent '${caller.handle}' cannot resolve a blocking comment authored by human '${comment.authorHandle}'`,
+          },
+          403,
+        );
+      }
+      if (
+        !repo.mergePolicy.allowAuthorResolveBlocking &&
+        caller.id === pr.authorActorId &&
+        caller.role !== "admin"
+      ) {
+        return c.json(
+          {
+            error: `PR author '${caller.handle}' cannot unilaterally resolve blocking comments under repo merge policy`,
+          },
+          403,
+        );
+      }
+    }
+
     const updated = store.setCommentResolved(comment.id, true, caller.id);
     await webhooks.emit(repo.id, "comment.resolved", {
       repo: store.stripRepoInternal(repo),
@@ -852,6 +1009,17 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
 
     const parsed = CreateReviewInputSchema.safeParse(await c.req.json());
     if (!parsed.success) return c.json({ error: "Invalid review payload" }, 400);
+
+    if (
+      parsed.data.status === "approved" &&
+      caller.id === pr.authorActorId &&
+      !repo.mergePolicy.allowSelfApproval
+    ) {
+      return c.json(
+        { error: `PR author '${caller.handle}' cannot approve their own pull request` },
+        403,
+      );
+    }
 
     const review = store.createReview({
       prId: pr.id,
@@ -973,13 +1141,29 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
     if (!pr) return c.json({ error: `PR #${num} not found` }, 404);
 
     const rawBody = await c.req.text();
-    const body = rawBody ? (JSON.parse(rawBody) as { force?: boolean }) : {};
-    const force = Boolean(body.force) && caller.role === "admin";
+    const parsedBody = rawBody
+      ? z
+          .object({
+            force: z.boolean().optional(),
+            mergeMethod: MergeMethodSchema.optional(),
+          })
+          .safeParse(JSON.parse(rawBody))
+      : { success: true as const, data: {} as { force?: boolean; mergeMethod?: MergeMethod } };
+    if (!parsedBody.success) {
+      return c.json({ error: "Invalid merge payload" }, 400);
+    }
+    const force = Boolean(parsedBody.data.force) && caller.role === "admin";
 
     try {
-      const result = await executeMerge(repo, pr, caller, force);
+      const result = await executeMerge(repo, pr, caller, force, parsedBody.data.mergeMethod);
       return c.json({ pr: result.pr, mergedSha: result.mergedSha });
     } catch (err) {
+      if (err instanceof MergeConflictError) {
+        return c.json(
+          { error: err.message, conflictingFiles: err.conflictingFiles },
+          409,
+        );
+      }
       const e = err as Error & { statusCode?: number; gate?: unknown };
       return c.json(
         { error: e.message, gate: e.gate },

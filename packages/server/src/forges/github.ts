@@ -1,6 +1,19 @@
-import type { CiCheck, CiCheckStatus, DiffFile } from "@agentic-git/shared";
+import type { CiCheck, CiCheckStatus, DiffFile, MergeMethod } from "@agentic-git/shared";
 import type { RepoRowInternal } from "../db.js";
-import type { ForgeAdapter, ShadowPrResult } from "./types.js";
+import { MergeConflictError, type ForgeAdapter, type ShadowPrResult } from "./types.js";
+
+function encodeGitRef(ref: string): string {
+  return ref.split("/").map(encodeURIComponent).join("/");
+}
+
+function parseNextLinkHeader(linkHeader: string | null): string | null {
+  if (!linkHeader) return null;
+  for (const part of linkHeader.split(",")) {
+    const match = part.match(/<([^>]+)>\s*;\s*rel="next"/);
+    if (match) return match[1];
+  }
+  return null;
+}
 
 function mapGitHubConclusion(status: string, conclusion: string | null): CiCheckStatus {
   if (status === "queued") return "pending";
@@ -98,7 +111,7 @@ export class GitHubForgeAdapter implements ForgeAdapter {
     token: string,
     branch: string,
   ): Promise<string | null> {
-    const url = `${this.apiBase(repo)}/repos/${repo.upstreamRepo}/git/ref/heads/${encodeURIComponent(branch)}`;
+    const url = `${this.apiBase(repo)}/repos/${repo.upstreamRepo}/git/ref/heads/${encodeGitRef(branch)}`;
     const res = await this.fetchImpl(url, { headers: this.headers(token) });
     if (res.status === 404) return null;
     if (!res.ok) throw new Error(`GitHub ref lookup failed (${res.status}): ${await res.text()}`);
@@ -112,18 +125,29 @@ export class GitHubForgeAdapter implements ForgeAdapter {
     params: { upstreamPrId?: string | null; sourceBranch: string; targetBranch: string },
   ): Promise<DiffFile[]> {
     if (params.upstreamPrId) {
-      const url = `${this.apiBase(repo)}/repos/${repo.upstreamRepo}/pulls/${params.upstreamPrId}/files?per_page=100`;
-      const files = await this.requestJson<
-        Array<{
-          filename: string;
-          previous_filename?: string;
-          status: string;
-          additions: number;
-          deletions: number;
-          patch?: string;
-        }>
-      >(url, token);
-      return files.map((f) => ({
+      type GitHubFileEntry = {
+        filename: string;
+        previous_filename?: string;
+        status: string;
+        additions: number;
+        deletions: number;
+        patch?: string;
+      };
+      const allFiles: GitHubFileEntry[] = [];
+      let nextUrl: string | null =
+        `${this.apiBase(repo)}/repos/${repo.upstreamRepo}/pulls/${params.upstreamPrId}/files?per_page=100`;
+      const maxPages = 30;
+      for (let page = 0; nextUrl && page < maxPages; page++) {
+        const res = await this.fetchImpl(nextUrl, { headers: this.headers(token) });
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(`GitHub API ${res.status} ${nextUrl}: ${text}`);
+        }
+        const batch = (await res.json()) as GitHubFileEntry[];
+        allFiles.push(...batch);
+        nextUrl = parseNextLinkHeader(res.headers.get("link"));
+      }
+      return allFiles.map((f) => ({
         path: f.filename,
         oldPath: f.previous_filename ?? null,
         status: mapGitHubFileStatus(f.status),
@@ -133,7 +157,7 @@ export class GitHubForgeAdapter implements ForgeAdapter {
       }));
     }
 
-    const url = `${this.apiBase(repo)}/repos/${repo.upstreamRepo}/compare/${encodeURIComponent(params.targetBranch)}...${encodeURIComponent(params.sourceBranch)}`;
+    const url = `${this.apiBase(repo)}/repos/${repo.upstreamRepo}/compare/${encodeGitRef(params.targetBranch)}...${encodeGitRef(params.sourceBranch)}`;
     const data = await this.requestJson<{
       files?: Array<{
         filename: string;
@@ -212,19 +236,35 @@ export class GitHubForgeAdapter implements ForgeAdapter {
   async mergePr(
     repo: RepoRowInternal,
     token: string,
-    params: { upstreamPrId?: string | null; sourceBranch: string; targetBranch: string; commitTitle: string },
+    params: {
+      upstreamPrId?: string | null;
+      sourceBranch: string;
+      targetBranch: string;
+      commitTitle: string;
+      mergeMethod?: MergeMethod;
+    },
   ): Promise<{ mergedSha: string }> {
     if (!params.upstreamPrId) {
       throw new Error("GitHub merge requires an upstream shadow PR number");
     }
+    const mergeMethod = params.mergeMethod ?? repo.mergePolicy.mergeMethod ?? "squash";
     const url = `${this.apiBase(repo)}/repos/${repo.upstreamRepo}/pulls/${params.upstreamPrId}/merge`;
-    const data = await this.requestJson<{ sha: string }>(url, token, {
+    const res = await this.fetchImpl(url, {
       method: "PUT",
+      headers: this.headers(token),
       body: JSON.stringify({
         commit_title: params.commitTitle,
-        merge_method: "squash",
+        merge_method: mergeMethod,
       }),
     });
+    if (!res.ok) {
+      const text = await res.text();
+      if (res.status === 405 || res.status === 409) {
+        throw new MergeConflictError(`GitHub rejected merge (${res.status}): ${text}`);
+      }
+      throw new Error(`GitHub API ${res.status} ${url}: ${text}`);
+    }
+    const data = (await res.json()) as { sha: string };
     return { mergedSha: data.sha };
   }
 }

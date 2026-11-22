@@ -104,6 +104,86 @@ export function buildReceivePackRejectResponse(
   return Buffer.concat([msgBand, statusBand, Buffer.from("0000", "ascii")]);
 }
 
+export interface ReceivePackRefResult {
+  ok: boolean;
+  message: string;
+}
+
+export interface ParsedReceivePackResult {
+  unpackOk: boolean;
+  refs: Map<string, ReceivePackRefResult>;
+}
+
+function readPktLines(buf: Buffer): Buffer[] {
+  const packets: Buffer[] = [];
+  let offset = 0;
+  while (offset + 4 <= buf.length) {
+    const lenHex = buf.subarray(offset, offset + 4).toString("ascii");
+    if (lenHex === "0000" || lenHex === "0001" || lenHex === "0002") {
+      offset += 4;
+      continue;
+    }
+    const pktLen = Number.parseInt(lenHex, 16);
+    if (!Number.isFinite(pktLen) || pktLen < 4 || offset + pktLen > buf.length) {
+      break;
+    }
+    packets.push(buf.subarray(offset + 4, offset + pktLen));
+    offset += pktLen;
+  }
+  return packets;
+}
+
+/**
+ * Parses an upstream `git-receive-pack` Smart-HTTP response (plain report-status or side-band)
+ * to determine which refs were actually accepted (`ok`) vs rejected (`ng`).
+ */
+export function parseReceivePackResult(rawBody: Uint8Array): ParsedReceivePackResult {
+  const buf = Buffer.from(rawBody);
+  const outerPackets = readPktLines(buf);
+
+  const band1Chunks: Buffer[] = [];
+  const plainLines: string[] = [];
+
+  for (const pkt of outerPackets) {
+    if (pkt.length === 0) continue;
+    const band = pkt[0];
+    if (band === 0x01) {
+      band1Chunks.push(pkt.subarray(1));
+    } else if (band === 0x02 || band === 0x03) {
+      // Progress / error human text bands; ignore for status parsing
+      continue;
+    } else {
+      plainLines.push(pkt.toString("utf8").trim());
+    }
+  }
+
+  const statusLines =
+    band1Chunks.length > 0
+      ? readPktLines(Buffer.concat(band1Chunks)).map((p) => p.toString("utf8").trim())
+      : plainLines;
+
+  let unpackOk = true;
+  const refs = new Map<string, ReceivePackRefResult>();
+
+  for (const line of statusLines) {
+    if (!line) continue;
+    if (line.startsWith("unpack ")) {
+      unpackOk = line === "unpack ok";
+    } else if (line.startsWith("ok ")) {
+      const ref = line.slice(3).trim();
+      if (ref) refs.set(ref, { ok: true, message: "" });
+    } else if (line.startsWith("ng ")) {
+      const rest = line.slice(3).trim();
+      const spaceIdx = rest.indexOf(" ");
+      const ref = spaceIdx === -1 ? rest : rest.slice(0, spaceIdx);
+      const message = spaceIdx === -1 ? "" : rest.slice(spaceIdx + 1).trim();
+      if (ref) refs.set(ref, { ok: false, message });
+    }
+  }
+
+  return { unpackOk, refs };
+}
+
 /**
  * Builds the Basic Auth header for upstream Git Smart-HTTP forwarding.
  */

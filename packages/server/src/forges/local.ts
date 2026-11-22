@@ -3,9 +3,9 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { CiCheck, DiffFile } from "@agentic-git/shared";
+import type { CiCheck, DiffFile, MergeMethod } from "@agentic-git/shared";
 import type { RepoRowInternal } from "../db.js";
-import type { ForgeAdapter, ShadowPrResult } from "./types.js";
+import { MergeConflictError, type ForgeAdapter, type ShadowPrResult } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -121,21 +121,60 @@ export class LocalGitForgeAdapter implements ForgeAdapter {
   async mergePr(
     repo: RepoRowInternal,
     _token: string,
-    params: { upstreamPrId?: string | null; sourceBranch: string; targetBranch: string; commitTitle: string },
+    params: {
+      upstreamPrId?: string | null;
+      sourceBranch: string;
+      targetBranch: string;
+      commitTitle: string;
+      mergeMethod?: MergeMethod;
+    },
   ): Promise<{ mergedSha: string }> {
     const bareDir = repo.upstreamRepo;
+    const mergeMethod = params.mergeMethod ?? repo.mergePolicy.mergeMethod ?? "merge";
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "agit-merge-"));
     try {
       await runGit(tmpDir, ["clone", "--branch", params.targetBranch, bareDir, "."]);
       await runGit(tmpDir, ["config", "user.name", "agentic-git"]);
       await runGit(tmpDir, ["config", "user.email", "merge@agentic-git.local"]);
-      await runGit(tmpDir, [
-        "merge",
-        "--no-ff",
-        `origin/${params.sourceBranch}`,
-        "-m",
-        params.commitTitle,
-      ]);
+      try {
+        if (mergeMethod === "squash") {
+          await runGit(tmpDir, ["merge", "--squash", `origin/${params.sourceBranch}`]);
+          await runGit(tmpDir, ["commit", "-m", params.commitTitle]);
+        } else if (mergeMethod === "rebase") {
+          await runGit(tmpDir, ["checkout", "-b", "__agit_rebase__", `origin/${params.sourceBranch}`]);
+          await runGit(tmpDir, ["rebase", params.targetBranch]);
+          await runGit(tmpDir, ["checkout", params.targetBranch]);
+          await runGit(tmpDir, ["merge", "--ff-only", "__agit_rebase__"]);
+        } else {
+          await runGit(tmpDir, [
+            "merge",
+            "--no-ff",
+            `origin/${params.sourceBranch}`,
+            "-m",
+            params.commitTitle,
+          ]);
+        }
+      } catch (err) {
+        let conflictingFiles: string[] = [];
+        try {
+          const out = await runGit(tmpDir, ["diff", "--name-only", "--diff-filter=U"]);
+          conflictingFiles = out
+            .split("\n")
+            .map((s) => s.trim())
+            .filter(Boolean);
+        } catch {
+          // ignore secondary inspection failure
+        }
+        if (conflictingFiles.length > 0 || (err instanceof Error && /conflict|merge|rebase/i.test(err.message))) {
+          throw new MergeConflictError(
+            conflictingFiles.length > 0
+              ? `Merge conflict in ${conflictingFiles.join(", ")}`
+              : `Merge conflict merging '${params.sourceBranch}' into '${params.targetBranch}'`,
+            conflictingFiles,
+          );
+        }
+        throw err;
+      }
       await runGit(tmpDir, ["push", "origin", params.targetBranch]);
       const mergedSha = (await runGit(tmpDir, ["rev-parse", "HEAD"])).trim();
       return { mergedSha };

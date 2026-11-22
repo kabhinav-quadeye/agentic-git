@@ -1,5 +1,16 @@
-import type { CiCheck, DiffFile } from "@agentic-git/shared";
+import type { CiCheck, DiffFile, MergeMethod } from "@agentic-git/shared";
 import type { RepoRowInternal } from "../db.js";
+
+export class MergeConflictError extends Error {
+  readonly statusCode = 409;
+  readonly conflictingFiles: string[];
+
+  constructor(message: string, conflictingFiles: string[] = []) {
+    super(message);
+    this.name = "MergeConflictError";
+    this.conflictingFiles = conflictingFiles;
+  }
+}
 
 export interface ShadowPrResult {
   upstreamPrId: string;
@@ -43,6 +54,7 @@ export interface ForgeAdapter {
       sourceBranch: string;
       targetBranch: string;
       commitTitle: string;
+      mergeMethod?: MergeMethod;
     },
   ): Promise<{ mergedSha: string }>;
 }

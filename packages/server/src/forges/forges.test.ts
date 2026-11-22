@@ -13,6 +13,7 @@ function makeRepo(overrides: Partial<RepoRowInternal>): RepoRowInternal {
     upstreamRepo: "acme/service",
     upstreamGitUrl: "https://github.com/acme/service.git",
     upstreamToken: "tok_upstream",
+    incomingWebhookSecret: "",
     defaultBranch: "main",
     credentialMode: "service",
     protectedBranches: ["main"],
@@ -102,6 +103,110 @@ describe("GitHubForgeAdapter", () => {
     });
     expect(merged.mergedSha).toBe("merged_gh_sha");
     expect(calls.every((c) => c.auth === "Bearer ghp_secret")).toBe(true);
+  });
+
+  it("preserves slashes when encoding branch refs for getBranchHeadSha and compare diffs", async () => {
+    const requestedUrls: string[] = [];
+    const mockFetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      requestedUrls.push(url);
+      if (url.includes("/git/ref/heads/")) {
+        return new Response(JSON.stringify({ object: { sha: "sha_slash_1" } }), { status: 200 });
+      }
+      if (url.includes("/compare/")) {
+        return new Response(JSON.stringify({ files: [] }), { status: 200 });
+      }
+      return new Response("Not Found", { status: 404 });
+    });
+
+    const adapter = new GitHubForgeAdapter(mockFetch as unknown as typeof fetch);
+    const repo = makeRepo({ forgeType: "github", upstreamRepo: "acme/service" });
+
+    const sha = await adapter.getBranchHeadSha(repo, "ghp_secret", "agent/claude/fix #1");
+    expect(sha).toBe("sha_slash_1");
+    await adapter.getPrDiff(repo, "ghp_secret", {
+      sourceBranch: "agent/claude/fix-1",
+      targetBranch: "release/v2",
+    });
+
+    expect(requestedUrls[0]).toBe(
+      "https://api.github.com/repos/acme/service/git/ref/heads/agent/claude/fix%20%231",
+    );
+    expect(requestedUrls[1]).toBe(
+      "https://api.github.com/repos/acme/service/compare/release/v2...agent/claude/fix-1",
+    );
+  });
+
+  it("paginates PR diff files across Link rel=next pages", async () => {
+    const mockFetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("page=2")) {
+        return new Response(
+          JSON.stringify([
+            { filename: "src/file2.ts", status: "added", additions: 2, deletions: 0, patch: "+b" },
+          ]),
+          { status: 200 },
+        );
+      }
+      return new Response(
+        JSON.stringify([
+          { filename: "src/file1.ts", status: "modified", additions: 1, deletions: 0, patch: "+a" },
+        ]),
+        {
+          status: 200,
+          headers: {
+            Link: '<https://api.github.com/repos/acme/service/pulls/17/files?per_page=100&page=2>; rel="next", <https://api.github.com/repos/acme/service/pulls/17/files?per_page=100&page=2>; rel="last"',
+          },
+        },
+      );
+    });
+
+    const adapter = new GitHubForgeAdapter(mockFetch as unknown as typeof fetch);
+    const repo = makeRepo({ forgeType: "github", upstreamRepo: "acme/service" });
+    const files = await adapter.getPrDiff(repo, "ghp_secret", {
+      upstreamPrId: "17",
+      sourceBranch: "agent/x",
+      targetBranch: "main",
+    });
+    expect(files.map((f) => f.path)).toEqual(["src/file1.ts", "src/file2.ts"]);
+  });
+
+  it("honors configurable mergeMethod and throws a 409 conflict error when GitHub rejects merge", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const mockFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const parsed = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      bodies.push(parsed);
+      if (parsed.merge_method === "rebase") {
+        return new Response(JSON.stringify({ message: "Pull Request is not mergeable" }), { status: 405 });
+      }
+      return new Response(JSON.stringify({ sha: "merged_merge_commit" }), { status: 200 });
+    });
+
+    const adapter = new GitHubForgeAdapter(mockFetch as unknown as typeof fetch);
+    const repo = makeRepo({
+      forgeType: "github",
+      upstreamRepo: "acme/service",
+      mergePolicy: { ...DEFAULT_MERGE_POLICY, mergeMethod: "merge" } as typeof DEFAULT_MERGE_POLICY,
+    });
+
+    const res = await adapter.mergePr(repo, "ghp_secret", {
+      upstreamPrId: "17",
+      sourceBranch: "agent/x",
+      targetBranch: "main",
+      commitTitle: "Merge PR #17",
+    });
+    expect(res.mergedSha).toBe("merged_merge_commit");
+    expect(bodies[0].merge_method).toBe("merge");
+
+    await expect(
+      adapter.mergePr(repo, "ghp_secret", {
+        upstreamPrId: "17",
+        sourceBranch: "agent/x",
+        targetBranch: "main",
+        commitTitle: "Rebase PR #17",
+        mergeMethod: "rebase",
+      } as Parameters<typeof adapter.mergePr>[2]),
+    ).rejects.toMatchObject({ statusCode: 409 });
   });
 });
 

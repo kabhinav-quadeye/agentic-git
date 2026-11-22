@@ -384,9 +384,16 @@ describe("End-to-end Git Smart-HTTP proxy + Shadow PR + Typed Comments + Diff Fi
     expect(rev2.data.gate.canMerge).toBe(false);
     expect(rev2.data.gate.comments.unresolvedBlockingIds).toEqual([blockingCmt.data.comment.id]);
 
-    // 9. Resolving the blocking comment satisfies ALL gates -> AUTO-MERGES immediately even though defer_to_next_pr is unresolved!
-    const resolveRes = await api<{ autoMerged: boolean; mergedSha: string }>(
+    // 9. PR author cannot unilaterally resolve reviewer's blocking comment; once security-agent resolves it, ALL gates pass -> AUTO-MERGES immediately even though defer_to_next_pr is unresolved!
+    const deniedResolve = await api<{ error: string }>(
       coderBotToken,
+      "POST",
+      `/api/comments/${blockingCmt.data.comment.id}/resolve`,
+    );
+    expect(deniedResolve.status).toBe(403);
+
+    const resolveRes = await api<{ autoMerged: boolean; mergedSha: string }>(
+      securityBotToken,
       "POST",
       `/api/comments/${blockingCmt.data.comment.id}/resolve`,
     );

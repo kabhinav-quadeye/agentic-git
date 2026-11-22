@@ -25,6 +25,7 @@ export interface ActorRowInternal extends Actor {
 
 export interface RepoRowInternal extends Repo {
   upstreamToken: string;
+  incomingWebhookSecret: string;
 }
 
 export function hashToken(token: string): string {
@@ -79,6 +80,7 @@ export class Store {
         upstream_repo TEXT NOT NULL,
         upstream_git_url TEXT NOT NULL,
         upstream_token TEXT NOT NULL,
+        incoming_webhook_secret TEXT NOT NULL DEFAULT '',
         default_branch TEXT NOT NULL,
         credential_mode TEXT NOT NULL,
         protected_branches TEXT NOT NULL,
@@ -180,6 +182,12 @@ export class Store {
         PRIMARY KEY (repo_id, cache_key)
       );
     `);
+
+    // Backfill columns on pre-existing SQLite databases
+    const repoCols = this.db.prepare(`PRAGMA table_info(repos)`).all() as Array<{ name: string }>;
+    if (!repoCols.some((col) => col.name === "incoming_webhook_secret")) {
+      this.db.exec(`ALTER TABLE repos ADD COLUMN incoming_webhook_secret TEXT NOT NULL DEFAULT ''`);
+    }
   }
 
   // ---- Actors ----
@@ -301,6 +309,7 @@ export class Store {
     upstreamRepo: string;
     upstreamGitUrl: string;
     upstreamToken: string;
+    incomingWebhookSecret?: string;
     defaultBranch?: string;
     credentialMode?: Repo["credentialMode"];
     protectedBranches?: string[];
@@ -313,8 +322,8 @@ export class Store {
     const policy: MergePolicy = { ...DEFAULT_MERGE_POLICY, ...input.mergePolicy };
     this.db
       .prepare(
-        `INSERT INTO repos (id, slug, forge_type, forge_base_url, upstream_repo, upstream_git_url, upstream_token, default_branch, credential_mode, protected_branches, merge_policy, diff_filter_rules, custom_comment_types, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO repos (id, slug, forge_type, forge_base_url, upstream_repo, upstream_git_url, upstream_token, incoming_webhook_secret, default_branch, credential_mode, protected_branches, merge_policy, diff_filter_rules, custom_comment_types, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -324,6 +333,7 @@ export class Store {
         input.upstreamRepo,
         input.upstreamGitUrl,
         input.upstreamToken,
+        input.incomingWebhookSecret ?? "",
         input.defaultBranch ?? "main",
         input.credentialMode ?? "service",
         JSON.stringify(input.protectedBranches ?? ["main", "master"]),
@@ -344,6 +354,7 @@ export class Store {
       upstreamRepo: String(row.upstream_repo),
       upstreamGitUrl: String(row.upstream_git_url),
       upstreamToken: String(row.upstream_token),
+      incomingWebhookSecret: row.incoming_webhook_secret ? String(row.incoming_webhook_secret) : "",
       defaultBranch: String(row.default_branch),
       credentialMode: row.credential_mode as Repo["credentialMode"],
       protectedBranches: JSON.parse(String(row.protected_branches)),
@@ -355,7 +366,7 @@ export class Store {
   }
 
   stripRepoInternal(repo: RepoRowInternal): Repo {
-    const { upstreamToken: _ignored, ...rest } = repo;
+    const { upstreamToken: _ignored, incomingWebhookSecret: _ignoredSecret, ...rest } = repo;
     return rest;
   }
 
@@ -391,6 +402,7 @@ export class Store {
       customCommentTypes?: CommentTypeDefinition[];
       credentialMode?: Repo["credentialMode"];
       upstreamToken?: string;
+      incomingWebhookSecret?: string;
     },
   ): Repo {
     const existing = this.getRepoById(repoId);
@@ -398,7 +410,7 @@ export class Store {
     this.db
       .prepare(
         `UPDATE repos
-         SET protected_branches = ?, merge_policy = ?, diff_filter_rules = ?, custom_comment_types = ?, credential_mode = ?, upstream_token = ?
+         SET protected_branches = ?, merge_policy = ?, diff_filter_rules = ?, custom_comment_types = ?, credential_mode = ?, upstream_token = ?, incoming_webhook_secret = ?
          WHERE id = ?`,
       )
       .run(
@@ -408,6 +420,7 @@ export class Store {
         JSON.stringify(patch.customCommentTypes ?? existing.customCommentTypes),
         patch.credentialMode ?? existing.credentialMode,
         patch.upstreamToken ?? existing.upstreamToken,
+        patch.incomingWebhookSecret ?? existing.incomingWebhookSecret,
         repoId,
       );
     return this.stripRepoInternal(this.getRepoById(repoId)!);
@@ -555,10 +568,18 @@ export class Store {
   }
 
   updatePrHeadSha(prId: string, headSha: string): PullRequest {
+    const existing = this.getPrById(prId);
     const now = new Date().toISOString();
-    this.db
-      .prepare(`UPDATE pull_requests SET head_sha = ?, updated_at = ? WHERE id = ?`)
-      .run(headSha, now, prId);
+    if (existing && existing.headSha !== headSha) {
+      // Clear stale CI checks from the previous head commit
+      this.db
+        .prepare(`UPDATE pull_requests SET head_sha = ?, ci_checks = '[]', updated_at = ? WHERE id = ?`)
+        .run(headSha, now, prId);
+    } else {
+      this.db
+        .prepare(`UPDATE pull_requests SET head_sha = ?, updated_at = ? WHERE id = ?`)
+        .run(headSha, now, prId);
+    }
     return this.getPrById(prId)!;
   }
 

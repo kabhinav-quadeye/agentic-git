@@ -417,16 +417,32 @@ export function buildProgram(): Command {
   prCmd
     .command("merge <number>")
     .option("--force", "Admin-only force merge bypassing gates", false)
-    .action(async (numStr: string, cmdOpts: { force?: boolean }, cmd: Command) => {
+    .option("--method <method>", "Merge method: merge | squash | rebase")
+    .action(async (numStr: string, cmdOpts: { force?: boolean; method?: string }, cmd: Command) => {
       const { client, opts } = getClient(cmd);
       const slug = resolveRepo(opts);
       const data = await client.request<{ pr: PullRequest; mergedSha: string }>(
         "POST",
         `/api/repos/${slug}/prs/${numStr}/merge`,
-        { force: cmdOpts.force },
+        { force: cmdOpts.force, mergeMethod: cmdOpts.method },
       );
       printOutput(opts, data, () => {
         console.log(`Merged PR #${numStr} -> ${data.mergedSha}`);
+      });
+    });
+
+  prCmd
+    .command("close <number>")
+    .description("Close an open pull request")
+    .action(async (numStr: string, _opts, cmd: Command) => {
+      const { client, opts } = getClient(cmd);
+      const slug = resolveRepo(opts);
+      const data = await client.request<{ pr: PullRequest }>(
+        "POST",
+        `/api/repos/${slug}/prs/${numStr}/close`,
+      );
+      printOutput(opts, data, () => {
+        console.log(`Closed PR #${data.pr.number}: ${data.pr.title}`);
       });
     });
 

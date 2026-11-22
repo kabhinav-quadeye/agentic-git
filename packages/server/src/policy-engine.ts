@@ -95,8 +95,14 @@ export function evaluateMergeGate(params: {
   const changesRequestedHandles: string[] = [];
 
   for (const [handle, rev] of effectiveReviews.entries()) {
-    if (rev.status === "approved") approvedHandles.push(handle);
-    else if (rev.status === "changes_requested") changesRequestedHandles.push(handle);
+    if (rev.status === "approved") {
+      if (!policy.allowSelfApproval && handle === pr.authorHandle) {
+        continue;
+      }
+      approvedHandles.push(handle);
+    } else if (rev.status === "changes_requested") {
+      changesRequestedHandles.push(handle);
+    }
   }
 
   const approvedSet = new Set(approvedHandles);
@@ -204,7 +210,8 @@ export function filterDiffFiles(params: {
   includeHidden?: boolean;
 }): FilteredDiffResponse {
   const { pr, files, rules, viewer, reviews, includeHidden = false } = params;
-  const effectiveReviews = getEffectiveReviewsByActor(reviews, pr.headSha, false);
+  // Agent-approved diff filters only trust approvals for the current PR head SHA
+  const effectiveReviews = getEffectiveReviewsByActor(reviews, pr.headSha, true);
   const assignedSet = new Set(pr.assignedAgents);
 
   const activeRules = rules.filter((rule) => {

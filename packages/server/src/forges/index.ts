@@ -5,6 +5,7 @@ import { LocalGitForgeAdapter } from "./local.js";
 import type { ForgeAdapter } from "./types.js";
 
 export type { ForgeAdapter, ShadowPrResult } from "./types.js";
+export { MergeConflictError } from "./types.js";
 export { GitHubForgeAdapter, GitLabForgeAdapter, LocalGitForgeAdapter };
 
 export class ForgeRegistry {

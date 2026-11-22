@@ -1,6 +1,6 @@
-import type { CiCheck, CiCheckStatus, DiffFile } from "@agentic-git/shared";
+import type { CiCheck, CiCheckStatus, DiffFile, MergeMethod } from "@agentic-git/shared";
 import type { RepoRowInternal } from "../db.js";
-import type { ForgeAdapter, ShadowPrResult } from "./types.js";
+import { MergeConflictError, type ForgeAdapter, type ShadowPrResult } from "./types.js";
 
 function mapGitLabStatus(state: string): CiCheckStatus {
   if (state === "success") return "passed";
@@ -210,18 +210,35 @@ export class GitLabForgeAdapter implements ForgeAdapter {
   async mergePr(
     repo: RepoRowInternal,
     token: string,
-    params: { upstreamPrId?: string | null; sourceBranch: string; targetBranch: string; commitTitle: string },
+    params: {
+      upstreamPrId?: string | null;
+      sourceBranch: string;
+      targetBranch: string;
+      commitTitle: string;
+      mergeMethod?: MergeMethod;
+    },
   ): Promise<{ mergedSha: string }> {
     if (!params.upstreamPrId) {
       throw new Error("GitLab merge requires an upstream shadow MR IID");
     }
+    const mergeMethod = params.mergeMethod ?? repo.mergePolicy.mergeMethod ?? "squash";
     const url = `${this.apiBase(repo)}/projects/${this.projectPath(repo)}/merge_requests/${params.upstreamPrId}/merge`;
-    const data = await this.requestJson<{ merge_commit_sha?: string; sha?: string }>(url, token, {
+    const res = await this.fetchImpl(url, {
       method: "PUT",
+      headers: this.headers(token),
       body: JSON.stringify({
         merge_commit_message: params.commitTitle,
+        squash: mergeMethod === "squash",
       }),
     });
+    if (!res.ok) {
+      const text = await res.text();
+      if (res.status === 405 || res.status === 406 || res.status === 409) {
+        throw new MergeConflictError(`GitLab rejected merge (${res.status}): ${text}`);
+      }
+      throw new Error(`GitLab API ${res.status} ${url}: ${text}`);
+    }
+    const data = (await res.json()) as { merge_commit_sha?: string; sha?: string };
     return { mergedSha: data.merge_commit_sha ?? data.sha ?? "" };
   }
 }
