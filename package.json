@@ -1,0 +1,20 @@
+{
+  "name": "agentic-git",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace=@agentic-git/shared && npm run build --workspace=@agentic-git/server && npm run build --workspace=@agentic-git/cli && npm run build --workspace=@agentic-git/web",
+    "test": "npm run test --workspace=@agentic-git/shared && npm run test --workspace=@agentic-git/server && npm run test --workspace=@agentic-git/cli",
+    "typecheck": "npm run typecheck --workspace=@agentic-git/shared && npm run typecheck --workspace=@agentic-git/server && npm run typecheck --workspace=@agentic-git/cli && npm run typecheck --workspace=@agentic-git/web",
+    "dev:server": "npm run dev --workspace=@agentic-git/server",
+    "dev:web": "npm run dev --workspace=@agentic-git/web"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.2",
+    "vitest": "^3.1.1"
+  }
+}
