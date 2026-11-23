@@ -241,9 +241,15 @@ export function filterDiffFiles(params: {
     const matchedRule = activeRules.find((r) => matchAnyGlob(file.path, r.filePatterns));
     if (matchedRule) {
       const coveredBy = matchedRule.whenAgentApproved ?? matchedRule.whenAgentAssigned ?? null;
+      const approvedReview = matchedRule.whenAgentApproved
+        ? effectiveReviews.get(matchedRule.whenAgentApproved)
+        : undefined;
+      const approvedAtSha = approvedReview?.commitSha ?? null;
       const reasonParts: string[] = [];
       if (matchedRule.whenAgentApproved) {
-        reasonParts.push(`approved by ${matchedRule.whenAgentApproved}`);
+        reasonParts.push(
+          `approved by ${matchedRule.whenAgentApproved}${approvedAtSha ? ` @ ${approvedAtSha.slice(0, 7)}` : ""}`,
+        );
       } else if (matchedRule.whenAgentAssigned) {
         reasonParts.push(`assigned to ${matchedRule.whenAgentAssigned}`);
       } else {
@@ -258,6 +264,7 @@ export function filterDiffFiles(params: {
         hiddenByRuleId: matchedRule.id,
         hiddenByRuleName: matchedRule.name,
         coveredByAgent: coveredBy,
+        approvedAtSha,
         reason: `Hidden for ${viewer.type} (${reasonParts.join(", ")})`,
       });
       if (includeHidden) {

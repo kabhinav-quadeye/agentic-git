@@ -590,6 +590,53 @@ export function App() {
     }
   };
 
+  const handleFixBlockingWithAgent = async () => {
+    const target = invokeAgentHandle || agents[0]?.handle;
+    if (!selectedSlug || selectedPrNum === null) return;
+    if (!target) {
+      setError("No agent bots registered yet. Register a coding agent in Policy & Agents first.");
+      return;
+    }
+    setError(null);
+    try {
+      const res = await apiFetch<{
+        nothingToFix: boolean;
+        bundle: { blockingComments: unknown[]; errorFindings: unknown[]; failingChecks: unknown[] };
+        deliveries: unknown[];
+      }>(`/api/repos/${selectedSlug}/prs/${selectedPrNum}/fix-blocking`, {
+        method: "POST",
+        body: JSON.stringify({ agentHandle: target }),
+      });
+      if (res.nothingToFix) {
+        flashNotice("Nothing blocking to fix on this PR.");
+      } else {
+        const total =
+          res.bundle.blockingComments.length +
+          res.bundle.errorFindings.length +
+          res.bundle.failingChecks.length;
+        flashNotice(
+          `Dispatched ${total} blocking item(s) to ${target} (${res.deliveries.length} delivery).`,
+        );
+      }
+      await loadRepoData();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleCopyFollowups = async () => {
+    if (!selectedSlug || selectedPrNum === null) return;
+    try {
+      const res = await apiFetch<{ markdown: string }>(
+        `/api/repos/${selectedSlug}/prs/${selectedPrNum}/followups`,
+      );
+      await navigator.clipboard?.writeText(res.markdown);
+      flashNotice("Copied deferred follow-ups Markdown checklist to clipboard.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
   const [orgName] = selectedSlug ? selectedSlug.split("/") : ["agentic-git", ""];
 
   return (
@@ -1623,6 +1670,26 @@ export function App() {
                             {prDetail.pr.autoMerge ? "Disable auto-merge" : "Enable auto-merge"}
                           </button>
                         )}
+                        {prDetail.pr.status === "open" &&
+                          (prDetail.gate.comments.unresolvedBlockingIds.length > 0 ||
+                            prDetail.gate.comments.unresolvedErrorFindingIds.length > 0 ||
+                            prDetail.gate.ci.checks.some((ch) => ch.status === "failed")) && (
+                            <button
+                              type="button"
+                              className="btn btn-accent"
+                              disabled={agents.length === 0}
+                              onClick={handleFixBlockingWithAgent}
+                            >
+                              <PlayIcon size={14} />
+                              <span>
+                                Fix{" "}
+                                {prDetail.gate.comments.unresolvedBlockingIds.length +
+                                  prDetail.gate.comments.unresolvedErrorFindingIds.length +
+                                  prDetail.gate.ci.checks.filter((ch) => ch.status === "failed").length}{" "}
+                                blocking item(s) with Agent
+                              </span>
+                            </button>
+                          )}
                       </div>
                       {prDetail.pr.autoMerge && prDetail.pr.status === "open" && (
                         <span className="gh-label gh-label-purple">
@@ -1786,7 +1853,17 @@ export function App() {
                         {diffData.hiddenFiles.map((hf) => (
                           <div key={hf.path} className="muted">
                             <code style={{ color: "var(--gh-fg-default)" }}>{hf.path}</code>
-                            <div>Covered by {hf.coveredByAgent ?? hf.hiddenByRuleName}</div>
+                            <div>
+                              Covered by {hf.coveredByAgent ?? hf.hiddenByRuleName}
+                              {hf.approvedAtSha && (
+                                <>
+                                  {" "}
+                                  <span className="gh-label gh-label-pass mono">
+                                    verified @ {hf.approvedAtSha.slice(0, 7)}
+                                  </span>
+                                </>
+                              )}
+                            </div>
                           </div>
                         ))}
                       </div>
@@ -1796,6 +1873,27 @@ export function App() {
                       </div>
                     )}
                   </div>
+
+                  {prDetail.gate.comments.deferredCount > 0 && (
+                    <div className="gh-rail-section">
+                      <div className="gh-rail-heading">
+                        <span>Deferred Follow-ups</span>
+                        <span className="gh-counter">{prDetail.gate.comments.deferredCount}</span>
+                      </div>
+                      <div className="stack" style={{ gap: 6, fontSize: 12 }}>
+                        {prDetail.comments
+                          .filter((c) => c.commentType === "defer_to_next_pr" && !c.resolved)
+                          .map((c) => (
+                            <div key={c.id} className="muted">
+                              • {c.body}
+                            </div>
+                          ))}
+                        <button type="button" className="btn btn-sm" onClick={handleCopyFollowups}>
+                          Copy Follow-up Checklist
+                        </button>
+                      </div>
+                    </div>
+                  )}
 
                   <div className="gh-rail-section">
                     <div className="gh-rail-heading">

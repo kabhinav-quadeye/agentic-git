@@ -29,6 +29,7 @@ import {
   setupGitCredentialHelper,
   tryReadGhAuthToken,
 } from "./config.js";
+import { startMcpServer } from "./mcp.js";
 
 interface GlobalOpts {
   server?: string;
@@ -550,6 +551,35 @@ export function buildProgram(): Command {
       }
     });
   });
+
+  repoCmd
+    .command("preset [presetId]")
+    .description("List available diff-filter presets or apply one to the current repo")
+    .option("--agent <handle>", "Override agent handle for agent-gated presets (e.g. hide-tests-after-agent)")
+    .action(async (presetId: string | undefined, cmdOpts: { agent?: string }, cmd: Command) => {
+      const { client, opts } = getClient(cmd);
+      if (!presetId) {
+        const data = await client.request<{ presets: Array<{ id: string; name: string; description: string }> }>(
+          "GET",
+          "/api/presets/diff-filters",
+        );
+        printOutput(opts, data, () => {
+          for (const p of data.presets) {
+            console.log(`${p.id}  —  ${p.name}: ${p.description}`);
+          }
+        });
+        return;
+      }
+      const slug = resolveRepo(opts);
+      const data = await client.request<{ repo: Repo; appliedRule: { id: string; name: string } }>(
+        "POST",
+        `/api/repos/${slug}/presets/diff-filters`,
+        { presetId, agentHandle: cmdOpts.agent },
+      );
+      printOutput(opts, data, () => {
+        console.log(`Applied diff-filter preset '${data.appliedRule.id}' (${data.appliedRule.name}) to ${slug}`);
+      });
+    });
 
   // ---- user ----
   const userCmd = program.command("user").description("Manage human developer accounts and upstream tokens");
@@ -1236,6 +1266,170 @@ export function buildProgram(): Command {
       );
       printOutput(opts, data, () => {
         console.log(`Reopened PR #${data.pr.number}: ${data.pr.title}`);
+      });
+    });
+
+  prCmd
+    .command("followups [number]")
+    .description("Export unresolved defer_to_next_pr comments as an actionable follow-up checklist")
+    .option("--markdown", "Print only the Markdown checklist", false)
+    .action(async (numStr: string | undefined, cmdOpts: { markdown?: boolean }, cmd: Command) => {
+      const { client, opts } = getClient(cmd);
+      const slug = resolveRepo(opts);
+      const route = numStr
+        ? `/api/repos/${slug}/prs/${numStr}/followups`
+        : `/api/repos/${slug}/followups`;
+      const data = await client.request<{
+        items: Array<{ id: string; prNumber: number; body: string; filePath: string | null; line: number | null; authorHandle: string }>;
+        markdown: string;
+      }>("GET", route);
+      if (cmdOpts.markdown && !opts.json) {
+        console.log(data.markdown);
+        return;
+      }
+      printOutput(opts, data, () => {
+        console.log(data.markdown);
+      });
+    });
+
+  prCmd
+    .command("fix [number]")
+    .description("Bundle all blocking comments, error findings, and failing CI checks and dispatch to an agent")
+    .requiredOption("--agent <handle>", "Target coding agent handle")
+    .option("--prompt <text>", "Extra instruction for the agent", "")
+    .action(
+      async (
+        numStr: string | undefined,
+        cmdOpts: { agent: string; prompt: string },
+        cmd: Command,
+      ) => {
+        const { client, opts } = getClient(cmd);
+        const slug = resolveRepo(opts);
+        const resolvedNum = await resolvePrNumber(client, slug, numStr);
+        const data = await client.request<{
+          ok: boolean;
+          nothingToFix: boolean;
+          bundle: { blockingComments: unknown[]; errorFindings: unknown[]; failingChecks: unknown[] };
+          deliveries: unknown[];
+        }>("POST", `/api/repos/${slug}/prs/${resolvedNum}/fix-blocking`, {
+          agentHandle: cmdOpts.agent,
+          prompt: cmdOpts.prompt,
+        });
+        printOutput(opts, data, () => {
+          if (data.nothingToFix) {
+            console.log(`PR #${resolvedNum} has no blocking comments, error findings, or failing CI checks.`);
+            return;
+          }
+          console.log(
+            `Dispatched fix-blocking bundle to '${cmdOpts.agent}' on PR #${resolvedNum} ` +
+              `(${data.bundle.blockingComments.length} blocking, ${data.bundle.errorFindings.length} error findings, ${data.bundle.failingChecks.length} failing checks; ${data.deliveries.length} delivery(ies)).`,
+          );
+        });
+      },
+    );
+
+  // ---- mcp (first-class stdio MCP server for AI coding agents) ----
+  program
+    .command("mcp")
+    .description("Start a stdio MCP server exposing agentic-git PR, diff, comment, and merge-gate tools")
+    .action(async (_opts, cmd: Command) => {
+      const { client, opts } = getClient(cmd);
+      await startMcpServer(client, opts.repo);
+    });
+
+  // ---- doctor (diagnostics) ----
+  program
+    .command("doctor")
+    .description("Diagnose server reachability, authentication, git remotes, and credential helper health")
+    .action(async (_opts, cmd: Command) => {
+      const { client, opts, cfg } = getClient(cmd);
+      const checks: Array<{ name: string; status: "ok" | "warn" | "fail"; detail: string }> = [];
+
+      // 1. Server health
+      try {
+        await client.request("GET", "/api/health");
+        checks.push({ name: "server_health", status: "ok", detail: `Reachable at ${cfg.serverUrl}` });
+      } catch (err) {
+        checks.push({
+          name: "server_health",
+          status: "fail",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
+
+      // 2. Authentication
+      let authed = false;
+      try {
+        const me = await client.request<{ actor: Actor; hasUpstreamToken: boolean }>("GET", "/api/me");
+        authed = true;
+        checks.push({
+          name: "authentication",
+          status: "ok",
+          detail: `Authenticated as ${me.actor.handle} (${me.actor.type}/${me.actor.role})`,
+        });
+      } catch (err) {
+        checks.push({
+          name: "authentication",
+          status: "fail",
+          detail: `${err instanceof Error ? err.message : String(err)} — run \`agit auth login\``,
+        });
+      }
+
+      // 3. Git repository & remote detection
+      const detectedSlug = opts.repo ?? process.env.AGIT_REPO ?? inferRepoSlugFromGit();
+      if (detectedSlug) {
+        checks.push({ name: "git_repo", status: "ok", detail: `Detected repository '${detectedSlug}'` });
+        if (authed) {
+          try {
+            const repoData = await client.request<{ repo: Repo }>("GET", `/api/repos/${detectedSlug}`);
+            checks.push({
+              name: "repo_registered",
+              status: "ok",
+              detail: `Registered (${repoData.repo.forgeType} -> ${repoData.repo.upstreamRepo})`,
+            });
+          } catch {
+            checks.push({
+              name: "repo_registered",
+              status: "warn",
+              detail: `'${detectedSlug}' is not registered yet — run \`agit init\``,
+            });
+          }
+        }
+      } else {
+        checks.push({
+          name: "git_repo",
+          status: "warn",
+          detail: "Not inside a git repository (pass --repo <org/repo>)",
+        });
+      }
+
+      // 4. Git credential helper check
+      try {
+        const origin = new URL(cfg.serverUrl).origin;
+        const helper = execFileSync("git", ["config", "--global", `credential.${origin}.helper`], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+        }).trim();
+        checks.push({
+          name: "git_credential_helper",
+          status: helper.includes("agit") ? "ok" : "warn",
+          detail: helper ? `Configured: ${helper}` : "Not configured — run `agit auth setup-git`",
+        });
+      } catch {
+        checks.push({
+          name: "git_credential_helper",
+          status: "warn",
+          detail: "Not configured — run `agit auth setup-git` to avoid putting tokens in .git/config",
+        });
+      }
+
+      const ok = checks.every((c) => c.status !== "fail");
+      printOutput(opts, { ok, serverUrl: cfg.serverUrl, configPath: getConfigPath(), checks }, () => {
+        console.log(`agentic-git doctor (${cfg.serverUrl}):`);
+        for (const ch of checks) {
+          const badge = ch.status === "ok" ? "PASS" : ch.status === "warn" ? "WARN" : "FAIL";
+          console.log(`  [${badge}] ${ch.name}: ${ch.detail}`);
+        }
       });
     });
 

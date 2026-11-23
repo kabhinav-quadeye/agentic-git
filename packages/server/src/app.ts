@@ -11,6 +11,7 @@ import {
   CreateRepoInputSchema,
   CreateReviewInputSchema,
   CreateWebhookInputSchema,
+  DIFF_FILTER_PRESETS,
   DiffFilterRuleSchema,
   InvokeAgentInputSchema,
   MergeMethodSchema,
@@ -1405,6 +1406,222 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
         (e.statusCode as 409 | 500) ?? 500,
       );
     }
+  });
+
+  // ---- Diff-Filter Presets ----
+
+  app.get("/api/presets/diff-filters", (c) => {
+    return c.json({ presets: DIFF_FILTER_PRESETS });
+  });
+
+  app.post("/api/repos/:org/:repo/presets/diff-filters", async (c) => {
+    const caller = c.get("actor");
+    if (caller.type === "agent") {
+      return c.json({ error: "Agents cannot modify repository diff-filter presets" }, 403);
+    }
+    const slug = `${c.req.param("org")}/${c.req.param("repo")}`;
+    const repo = store.getRepoBySlug(slug);
+    if (!repo) return c.json({ error: `Repo '${slug}' not found` }, 404);
+
+    const parsed = z
+      .object({
+        presetId: z.string().min(1),
+        agentHandle: z.string().min(1).optional(),
+      })
+      .safeParse(await c.req.json());
+    if (!parsed.success) return c.json({ error: "Invalid preset payload" }, 400);
+
+    const template = DIFF_FILTER_PRESETS.find((p) => p.id === parsed.data.presetId);
+    if (!template) {
+      return c.json(
+        {
+          error: `Unknown preset '${parsed.data.presetId}'. Available: ${DIFF_FILTER_PRESETS.map((p) => p.id).join(", ")}`,
+        },
+        404,
+      );
+    }
+
+    const rule = {
+      ...template,
+      whenAgentApproved:
+        template.whenAgentApproved !== null && template.whenAgentApproved !== undefined
+          ? (parsed.data.agentHandle ?? template.whenAgentApproved)
+          : null,
+    };
+
+    const nextRules = [...repo.diffFilterRules.filter((r) => r.id !== rule.id), rule];
+    const updated = store.updateRepoConfig(repo.id, { diffFilterRules: nextRules });
+    return c.json({ repo: updated, appliedRule: rule });
+  });
+
+  // ---- Deferred Follow-ups (defer_to_next_pr) ----
+
+  function formatFollowupMarkdown(
+    repoSlug: string,
+    items: Array<{ prNumber: number; prTitle: string; body: string; filePath?: string | null; line?: number | null; authorHandle: string; id: string }>,
+  ): string {
+    if (items.length === 0) return `No deferred follow-up items for ${repoSlug}.`;
+    const lines = [`## Deferred Follow-ups (${repoSlug})`, ""];
+    for (const item of items) {
+      const loc = item.filePath ? ` (\`${item.filePath}${item.line ? `:${item.line}` : ""}\`)` : "";
+      lines.push(`- [ ] **PR #${item.prNumber}**${loc}: ${item.body} — _@${item.authorHandle}_`);
+    }
+    return lines.join("\n");
+  }
+
+  app.get("/api/repos/:org/:repo/followups", (c) => {
+    const slug = `${c.req.param("org")}/${c.req.param("repo")}`;
+    const repo = store.getRepoBySlug(slug);
+    if (!repo) return c.json({ error: `Repo '${slug}' not found` }, 404);
+    const prs = store.listPrs(repo.id);
+    const items = prs.flatMap((pr) =>
+      store
+        .listComments(pr.id, repo)
+        .filter((cm) => cm.commentType === "defer_to_next_pr" && !cm.resolved)
+        .map((cm) => ({
+          id: cm.id,
+          prNumber: pr.number,
+          prTitle: pr.title,
+          prStatus: pr.status,
+          authorHandle: cm.authorHandle,
+          body: cm.body,
+          filePath: cm.filePath ?? null,
+          line: cm.line ?? null,
+          createdAt: cm.createdAt,
+        })),
+    );
+    return c.json({
+      items,
+      markdown: formatFollowupMarkdown(repo.slug, items),
+    });
+  });
+
+  app.get("/api/repos/:org/:repo/prs/:number/followups", (c) => {
+    const slug = `${c.req.param("org")}/${c.req.param("repo")}`;
+    const repo = store.getRepoBySlug(slug);
+    if (!repo) return c.json({ error: `Repo '${slug}' not found` }, 404);
+    const num = Number.parseInt(c.req.param("number"), 10);
+    const pr = store.getPrByNumber(repo.id, num);
+    if (!pr) return c.json({ error: `PR #${num} not found` }, 404);
+
+    const items = store
+      .listComments(pr.id, repo)
+      .filter((cm) => cm.commentType === "defer_to_next_pr" && !cm.resolved)
+      .map((cm) => ({
+        id: cm.id,
+        prNumber: pr.number,
+        prTitle: pr.title,
+        prStatus: pr.status,
+        authorHandle: cm.authorHandle,
+        body: cm.body,
+        filePath: cm.filePath ?? null,
+        line: cm.line ?? null,
+        createdAt: cm.createdAt,
+      }));
+    return c.json({
+      pr,
+      items,
+      markdown: formatFollowupMarkdown(repo.slug, items),
+    });
+  });
+
+  // ---- One-Click "Fix All Blocking Comments" Agent Loop ----
+
+  app.post("/api/repos/:org/:repo/prs/:number/fix-blocking", async (c) => {
+    const caller = c.get("actor");
+    const slug = `${c.req.param("org")}/${c.req.param("repo")}`;
+    const repo = store.getRepoBySlug(slug);
+    if (!repo) return c.json({ error: `Repo '${slug}' not found` }, 404);
+    const num = Number.parseInt(c.req.param("number"), 10);
+    const pr = store.getPrByNumber(repo.id, num);
+    if (!pr) return c.json({ error: `PR #${num} not found` }, 404);
+
+    const parsed = z
+      .object({
+        agentHandle: z.string().min(1),
+        prompt: z.string().default(""),
+        targetUrl: z.string().url().optional(),
+      })
+      .safeParse(await c.req.json());
+    if (!parsed.success) {
+      return c.json({ error: "Invalid fix-blocking payload", details: parsed.error.flatten() }, 400);
+    }
+
+    const comments = store.listComments(pr.id, repo);
+    const typeMap = new Map(store.getAllCommentTypes(repo).map((t) => [t.key, t]));
+    const blockingComments = comments.filter(
+      (cm) => !cm.resolved && Boolean(typeMap.get(cm.commentType)?.blocksMerge),
+    );
+    const errorFindings = comments.filter(
+      (cm) =>
+        !cm.resolved &&
+        repo.mergePolicy.blockOnErrorFindings &&
+        cm.commentType === "agent_finding" &&
+        cm.severity === "error",
+    );
+    const failingChecks = pr.ciChecks.filter((ch) => ch.status === "failed");
+
+    const bundle = { blockingComments, errorFindings, failingChecks };
+    const totalItems = blockingComments.length + errorFindings.length + failingChecks.length;
+    if (totalItems === 0) {
+      return c.json({ ok: true, nothingToFix: true, bundle, deliveries: [] }, 200);
+    }
+
+    const lines = [
+      `Fix all ${totalItems} blocking item(s) on PR #${pr.number} (${pr.title}) on branch '${pr.sourceBranch}':`,
+    ];
+    for (const cm of blockingComments) {
+      const loc = cm.filePath ? ` [${cm.filePath}${cm.line ? `:${cm.line}` : ""}]` : "";
+      lines.push(`- [BLOCKING ${cm.id}]${loc} (${cm.authorHandle}): ${cm.body}`);
+    }
+    for (const ef of errorFindings) {
+      const loc = ef.filePath ? ` [${ef.filePath}${ef.line ? `:${ef.line}` : ""}]` : "";
+      lines.push(`- [ERROR FINDING ${ef.id}]${loc} (${ef.authorHandle}): ${ef.body}`);
+    }
+    for (const ch of failingChecks) {
+      lines.push(`- [FAILING CI] ${ch.name}: ${ch.summary ?? ch.status}`);
+    }
+    if (parsed.data.prompt) {
+      lines.push("", `Additional instruction: ${parsed.data.prompt}`);
+    }
+    const combinedPrompt = lines.join("\n");
+
+    const targetAgent = store.getActorByHandle(parsed.data.agentHandle);
+    const extraTargets: Array<{ id: string; url: string; secret: string }> = [];
+    const directUrl = parsed.data.targetUrl ?? targetAgent?.agentWebhookUrl ?? null;
+    if (directUrl) {
+      extraTargets.push({
+        id: `agent-direct:${parsed.data.agentHandle}`,
+        url: directUrl,
+        secret: "agentic-git-direct",
+      });
+    }
+
+    const deliveries = await webhooks.emit(
+      repo.id,
+      "agent.invoked",
+      {
+        repo: store.stripRepoInternal(repo),
+        pr,
+        invokedBy: store.stripActorInternal(caller),
+        targetAgentHandle: parsed.data.agentHandle,
+        mode: "fix_blocking",
+        prompt: combinedPrompt,
+        bundle,
+      },
+      extraTargets,
+    );
+
+    return c.json(
+      {
+        ok: true,
+        nothingToFix: false,
+        prompt: combinedPrompt,
+        bundle,
+        deliveries,
+      },
+      202,
+    );
   });
 
   // ---- Direct Agent Invocation (UI / CLI -> External Agentic App) ----

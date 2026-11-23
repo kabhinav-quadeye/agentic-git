@@ -1,13 +1,14 @@
 import React, { useEffect, useState } from "react";
-import type {
-  Actor,
-  CommentTypeDefinition,
-  DiffFilterRule,
-  ForgeType,
-  MergeMethod,
-  Repo,
-  WebhookEventType,
-  WebhookSubscription,
+import {
+  DIFF_FILTER_PRESETS,
+  type Actor,
+  type CommentTypeDefinition,
+  type DiffFilterRule,
+  type ForgeType,
+  type MergeMethod,
+  type Repo,
+  type WebhookEventType,
+  type WebhookSubscription,
 } from "@agentic-git/shared";
 import { BotIcon, GearIcon, PulseIcon, RepoIcon, ShieldIcon } from "./icons";
 
@@ -271,6 +272,26 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
         body: JSON.stringify({ diffFilterRules: next }),
       });
       await onRefresh();
+    } catch (err) {
+      onError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleApplyPreset = async (presetId: string) => {
+    if (!currentRepo) return;
+    try {
+      const res = await apiFetch<{ appliedRule: DiffFilterRule }>(
+        `/api/repos/${currentRepo.slug}/presets/diff-filters`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            presetId,
+            agentHandle: agents[0]?.handle,
+          }),
+        },
+      );
+      await onRefresh();
+      onNotice(`Applied preset '${res.appliedRule.name}'.`);
     } catch (err) {
       onError(err instanceof Error ? err.message : String(err));
     }
@@ -612,6 +633,29 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 <span>Agent-Aware Diff Filter Rules</span>
               </span>
               <span className="muted tabular">{currentRepo.diffFilterRules.length} rules</span>
+            </div>
+            <div
+              style={{
+                padding: "10px 14px",
+                borderBottom: "1px solid var(--gh-border-muted)",
+                background: "var(--gh-canvas-subtle)",
+              }}
+              className="row"
+            >
+              <span className="muted" style={{ fontSize: 12 }}>
+                1-click presets:
+              </span>
+              {DIFF_FILTER_PRESETS.map((preset) => (
+                <button
+                  key={preset.id}
+                  type="button"
+                  className="btn btn-sm"
+                  title={preset.description}
+                  onClick={() => handleApplyPreset(preset.id)}
+                >
+                  + {preset.name}
+                </button>
+              ))}
             </div>
             {currentRepo.diffFilterRules.length > 0 && (
               <table className="gh-table">

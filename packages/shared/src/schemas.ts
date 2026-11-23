@@ -138,6 +138,59 @@ export const DiffFilterRuleSchema = z.object({
 });
 export type DiffFilterRule = z.infer<typeof DiffFilterRuleSchema>;
 
+export const DIFF_FILTER_PRESETS: DiffFilterRule[] = [
+  {
+    id: "hide-lockfiles",
+    name: "Hide lockfiles",
+    description: "Hide dependency lockfiles from human reviewers while keeping them visible to agents.",
+    filePatterns: [
+      "**/package-lock.json",
+      "**/yarn.lock",
+      "**/pnpm-lock.yaml",
+      "**/Cargo.lock",
+      "**/go.sum",
+    ],
+    hideForActorTypes: ["human"],
+    hideForHandles: [],
+    whenAgentAssigned: null,
+    whenAgentApproved: null,
+    enabled: true,
+  },
+  {
+    id: "hide-snapshots",
+    name: "Hide snapshot files",
+    description: "Hide test snapshot diffs from human reviewers.",
+    filePatterns: ["**/*.snap", "**/__snapshots__/**"],
+    hideForActorTypes: ["human"],
+    hideForHandles: [],
+    whenAgentAssigned: null,
+    whenAgentApproved: null,
+    enabled: true,
+  },
+  {
+    id: "hide-generated",
+    name: "Hide generated code & build artifacts",
+    description: "Hide generated schemas, protobufs, and compiled bundles from human reviewers.",
+    filePatterns: ["**/*.generated.*", "**/*.gen.*", "**/dist/**"],
+    hideForActorTypes: ["human"],
+    hideForHandles: [],
+    whenAgentAssigned: null,
+    whenAgentApproved: null,
+    enabled: true,
+  },
+  {
+    id: "hide-tests-after-agent",
+    name: "Hide tests after review agent approves",
+    description: "Hide test diffs from humans once a dedicated test-review agent approves the current HEAD commit.",
+    filePatterns: ["**/*.test.{ts,tsx,js,jsx}", "**/*.spec.{ts,tsx,js,jsx}", "**/__tests__/**"],
+    hideForActorTypes: ["human"],
+    hideForHandles: [],
+    whenAgentAssigned: null,
+    whenAgentApproved: "test-review-agent",
+    enabled: true,
+  },
+];
+
 export const RepoSchema = z.object({
   id: z.string(),
   slug: z.string().regex(/^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/),
@@ -302,6 +355,7 @@ export const HiddenDiffFileSchema = z.object({
   hiddenByRuleId: z.string(),
   hiddenByRuleName: z.string(),
   coveredByAgent: z.string().nullable().optional(),
+  approvedAtSha: z.string().nullable().optional(),
   reason: z.string(),
 });
 export type HiddenDiffFile = z.infer<typeof HiddenDiffFileSchema>;
