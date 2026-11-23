@@ -18,6 +18,18 @@ export interface ShadowPrResult {
   headSha?: string;
 }
 
+export interface UpstreamPrInfo {
+  upstreamPrId: string;
+  upstreamPrUrl: string;
+  number: number;
+  title: string;
+  description: string;
+  sourceBranch: string;
+  targetBranch: string;
+  headSha: string;
+  authorHandle: string;
+}
+
 export interface ForgeAdapter {
   createShadowPr(
     repo: RepoRowInternal,
@@ -31,6 +43,10 @@ export interface ForgeAdapter {
   ): Promise<ShadowPrResult>;
 
   closeShadowPr(repo: RepoRowInternal, token: string, upstreamPrId: string): Promise<void>;
+
+  reopenShadowPr?(repo: RepoRowInternal, token: string, upstreamPrId: string): Promise<void>;
+
+  listOpenPrs?(repo: RepoRowInternal, token: string): Promise<UpstreamPrInfo[]>;
 
   getBranchHeadSha(repo: RepoRowInternal, token: string, branch: string): Promise<string | null>;
 

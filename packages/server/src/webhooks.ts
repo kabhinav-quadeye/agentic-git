@@ -182,6 +182,97 @@ export function parseGitHubCiWebhook(
   return null;
 }
 
+export type ParsedGitHubPrEvent =
+  | {
+      kind: "pr";
+      upstreamRepo: string;
+      action: string;
+      number: number;
+      title: string;
+      description: string;
+      upstreamPrUrl: string;
+      sourceBranch: string;
+      targetBranch: string;
+      headSha: string;
+      authorHandle: string;
+      merged: boolean;
+    }
+  | {
+      kind: "review";
+      upstreamRepo: string;
+      prNumber: number;
+      reviewerHandle: string;
+      status: "approved" | "changes_requested" | "commented";
+      body: string;
+      commitSha: string;
+    };
+
+export function parseGitHubPullRequestWebhook(
+  eventName: string,
+  body: Record<string, unknown>,
+): ParsedGitHubPrEvent | null {
+  const repoObj = body.repository as { full_name?: string } | undefined;
+  const upstreamRepo = repoObj?.full_name;
+  if (!upstreamRepo) return null;
+
+  if (eventName === "pull_request") {
+    const action = typeof body.action === "string" ? body.action : "";
+    const pr = body.pull_request as
+      | {
+          number?: number;
+          title?: string;
+          body?: string | null;
+          html_url?: string;
+          merged?: boolean;
+          head?: { ref?: string; sha?: string };
+          base?: { ref?: string };
+          user?: { login?: string };
+        }
+      | undefined;
+    if (!pr?.number || !pr.head?.ref || !pr.base?.ref || !pr.head?.sha) return null;
+    return {
+      kind: "pr",
+      upstreamRepo,
+      action,
+      number: pr.number,
+      title: pr.title ?? `PR #${pr.number}`,
+      description: pr.body ?? "",
+      upstreamPrUrl: pr.html_url ?? "",
+      sourceBranch: pr.head.ref,
+      targetBranch: pr.base.ref,
+      headSha: pr.head.sha,
+      authorHandle: pr.user?.login ?? "github-user",
+      merged: Boolean(pr.merged),
+    };
+  }
+
+  if (eventName === "pull_request_review" && body.action === "submitted") {
+    const pr = body.pull_request as { number?: number; head?: { sha?: string } } | undefined;
+    const rev = body.review as
+      | { state?: string; body?: string | null; commit_id?: string; user?: { login?: string } }
+      | undefined;
+    if (!pr?.number || !rev?.state) return null;
+    const stateLower = rev.state.toLowerCase();
+    const status =
+      stateLower === "approved"
+        ? "approved"
+        : stateLower === "changes_requested"
+          ? "changes_requested"
+          : "commented";
+    return {
+      kind: "review",
+      upstreamRepo,
+      prNumber: pr.number,
+      reviewerHandle: rev.user?.login ?? "github-reviewer",
+      status,
+      body: rev.body ?? "",
+      commitSha: rev.commit_id ?? pr.head?.sha ?? "",
+    };
+  }
+
+  return null;
+}
+
 export function parseGitLabCiWebhook(
   body: Record<string, unknown>,
 ): ParsedUpstreamCiUpdate | null {

@@ -45,6 +45,14 @@ export class LocalGitForgeAdapter implements ForgeAdapter {
     // No remote state to tear down for local bare repo
   }
 
+  async reopenShadowPr(): Promise<void> {
+    // No remote state to reopen for local bare repo
+  }
+
+  async listOpenPrs(): Promise<[]> {
+    return [];
+  }
+
   async getBranchHeadSha(
     repo: RepoRowInternal,
     _token: string,

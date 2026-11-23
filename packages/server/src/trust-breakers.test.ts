@@ -648,9 +648,11 @@ describe("Critical trust-breakers (end-to-end)", () => {
       }),
     });
     expect(prRes.status).toBe(201);
+    const createdPr = ((await prRes.json()) as { pr: { number: number } }).pr;
+    expect(createdPr.number).toBe(99);
 
     // Human reviewer approves
-    const revRes = await ctx.app.request("/api/repos/acme/auto/prs/1/reviews", {
+    const revRes = await ctx.app.request(`/api/repos/acme/auto/prs/${createdPr.number}/reviews`, {
       method: "POST",
       headers: { Authorization: `Bearer ${reviewer.token}`, "Content-Type": "application/json" },
       body: JSON.stringify({ status: "approved", body: "LGTM" }),
@@ -673,7 +675,7 @@ describe("Critical trust-breakers (end-to-end)", () => {
     });
     expect(whRes.status).toBe(200);
 
-    const finalPr = (await (await ctx.app.request("/api/repos/acme/auto/prs/1", {
+    const finalPr = (await (await ctx.app.request(`/api/repos/acme/auto/prs/${createdPr.number}`, {
       headers: { Authorization: `Bearer ${ctx.adminToken}` },
     })).json()) as { pr: { status: string; mergedByActorId: string | null } };
     expect(finalPr.pr.status).toBe("merged");

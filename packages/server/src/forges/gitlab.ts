@@ -1,6 +1,6 @@
 import type { CiCheck, CiCheckStatus, DiffFile, MergeMethod } from "@agentic-git/shared";
 import type { RepoRowInternal } from "../db.js";
-import { MergeConflictError, type ForgeAdapter, type ShadowPrResult } from "./types.js";
+import { MergeConflictError, type ForgeAdapter, type ShadowPrResult, type UpstreamPrInfo } from "./types.js";
 
 function mapGitLabStatus(state: string): CiCheckStatus {
   if (state === "success") return "passed";
@@ -96,6 +96,41 @@ export class GitLabForgeAdapter implements ForgeAdapter {
       method: "PUT",
       body: JSON.stringify({ state_event: "close" }),
     });
+  }
+
+  async reopenShadowPr(repo: RepoRowInternal, token: string, upstreamPrId: string): Promise<void> {
+    const url = `${this.apiBase(repo)}/projects/${this.projectPath(repo)}/merge_requests/${upstreamPrId}`;
+    await this.requestJson(url, token, {
+      method: "PUT",
+      body: JSON.stringify({ state_event: "reopen" }),
+    });
+  }
+
+  async listOpenPrs(repo: RepoRowInternal, token: string): Promise<UpstreamPrInfo[]> {
+    const url = `${this.apiBase(repo)}/projects/${this.projectPath(repo)}/merge_requests?state=opened&per_page=100`;
+    const list = await this.requestJson<
+      Array<{
+        iid: number;
+        title: string;
+        description?: string | null;
+        web_url: string;
+        source_branch: string;
+        target_branch: string;
+        sha?: string;
+        author?: { username?: string };
+      }>
+    >(url, token);
+    return list.map((m) => ({
+      upstreamPrId: String(m.iid),
+      upstreamPrUrl: m.web_url,
+      number: m.iid,
+      title: m.title,
+      description: m.description ?? "",
+      sourceBranch: m.source_branch,
+      targetBranch: m.target_branch,
+      headSha: m.sha ?? "",
+      authorHandle: m.author?.username ?? "gitlab-user",
+    }));
   }
 
   async getBranchHeadSha(

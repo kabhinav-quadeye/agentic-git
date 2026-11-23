@@ -36,6 +36,7 @@ import {
 import { evaluateMergeGate, filterDiffFiles } from "./policy-engine.js";
 import {
   parseGitHubCiWebhook,
+  parseGitHubPullRequestWebhook,
   parseGitLabCiWebhook,
   verifyGitHubWebhookSignature,
   verifyGitLabWebhookToken,
@@ -347,8 +348,10 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
     }
 
     const parsed = parseGitHubCiWebhook(eventName, body);
+    const parsedPrEvent = parseGitHubPullRequestWebhook(eventName, body);
     const repoObj = body.repository as { full_name?: string } | undefined;
-    const upstreamRepoName = parsed?.upstreamRepo ?? repoObj?.full_name ?? "";
+    const upstreamRepoName =
+      parsed?.upstreamRepo ?? parsedPrEvent?.upstreamRepo ?? repoObj?.full_name ?? "";
     const matchedRepos = store
       .listRepos()
       .map((r) => store.getRepoById(r.id)!)
@@ -367,6 +370,97 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
       if (!verifyGitHubWebhookSignature(secret, rawBody, sigHeader)) {
         return c.json({ error: "Invalid or missing GitHub webhook signature" }, 401);
       }
+    }
+
+    if (parsedPrEvent) {
+      let syncedCount = 0;
+      for (const repo of matchedRepos) {
+        if (parsedPrEvent.kind === "pr") {
+          const existing =
+            store.getPrByUpstreamId(repo.id, String(parsedPrEvent.number)) ??
+            store.getPrByNumber(repo.id, parsedPrEvent.number);
+
+          if (!existing && (parsedPrEvent.action === "opened" || parsedPrEvent.action === "reopened" || parsedPrEvent.action === "synchronize")) {
+            const author = store.getOrCreateExternalHumanActor(parsedPrEvent.authorHandle);
+            const created = store.createPr({
+              repoId: repo.id,
+              number: parsedPrEvent.number,
+              title: parsedPrEvent.title,
+              description: parsedPrEvent.description,
+              sourceBranch: parsedPrEvent.sourceBranch,
+              targetBranch: parsedPrEvent.targetBranch,
+              headSha: parsedPrEvent.headSha,
+              authorActorId: author.id,
+              upstreamPrId: String(parsedPrEvent.number),
+              upstreamPrUrl: parsedPrEvent.upstreamPrUrl,
+              autoMerge: repo.mergePolicy.defaultAutoMerge,
+              assignedAgents: [],
+            });
+            await webhooks.emit(repo.id, "pr.opened", {
+              repo: store.stripRepoInternal(repo),
+              pr: created,
+            });
+            syncedCount++;
+          } else if (existing) {
+            if (parsedPrEvent.action === "synchronize") {
+              const updated = store.updatePrHeadSha(existing.id, parsedPrEvent.headSha);
+              await webhooks.emit(repo.id, "pr.updated", {
+                repo: store.stripRepoInternal(repo),
+                pr: updated,
+              });
+              syncedCount++;
+            } else if (parsedPrEvent.action === "edited") {
+              store.updatePrSettings(existing.id, {
+                title: parsedPrEvent.title,
+                description: parsedPrEvent.description,
+              });
+              syncedCount++;
+            } else if (parsedPrEvent.action === "closed") {
+              if (parsedPrEvent.merged) {
+                const merger = store.getOrCreateExternalHumanActor(parsedPrEvent.authorHandle);
+                const mergedPr = store.markPrMerged(existing.id, merger.id);
+                await webhooks.emit(repo.id, "pr.merged", {
+                  repo: store.stripRepoInternal(repo),
+                  pr: mergedPr,
+                });
+              } else {
+                const closedPr = store.markPrClosed(existing.id);
+                await webhooks.emit(repo.id, "pr.closed", {
+                  repo: store.stripRepoInternal(repo),
+                  pr: closedPr,
+                });
+              }
+              syncedCount++;
+            } else if (parsedPrEvent.action === "reopened") {
+              store.markPrOpen(existing.id);
+              syncedCount++;
+            }
+          }
+        } else if (parsedPrEvent.kind === "review") {
+          const existing =
+            store.getPrByUpstreamId(repo.id, String(parsedPrEvent.prNumber)) ??
+            store.getPrByNumber(repo.id, parsedPrEvent.prNumber);
+          if (existing) {
+            const reviewer = store.getOrCreateExternalHumanActor(parsedPrEvent.reviewerHandle);
+            const review = store.createReview({
+              prId: existing.id,
+              actorId: reviewer.id,
+              status: parsedPrEvent.status,
+              body: parsedPrEvent.body,
+              commitSha: parsedPrEvent.commitSha || existing.headSha,
+            });
+            await webhooks.emit(repo.id, "review.submitted", {
+              repo: store.stripRepoInternal(repo),
+              pr: existing,
+              review,
+            });
+            const mergeActor = resolveAutoMergeActor(existing);
+            await maybeAutoMerge(repo, existing.id, mergeActor);
+            syncedCount++;
+          }
+        }
+      }
+      return c.json({ ok: true, syncedCount });
     }
 
     if (!parsed) return c.json({ ok: true, ignored: true });
@@ -531,6 +625,22 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
     return c.json({ ok: true });
   });
 
+  app.delete("/api/actors/:id", (c) => {
+    const caller = c.get("actor");
+    const targetId = c.req.param("id");
+    const target = store.getActorById(targetId);
+    if (!target) return c.json({ error: "Actor not found" }, 404);
+    if (target.handle === "admin") {
+      return c.json({ error: "Cannot delete the system admin actor" }, 400);
+    }
+    const isOwnerOfBot = target.type === "agent" && target.ownerId === caller.id;
+    if (caller.role !== "admin" && !isOwnerOfBot) {
+      return c.json({ error: "Forbidden" }, 403);
+    }
+    store.deleteActor(targetId);
+    return c.json({ ok: true });
+  });
+
   // ---- Repositories ----
 
   app.get("/api/repos", (c) => {
@@ -604,6 +714,84 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
     });
   });
 
+  app.delete("/api/repos/:org/:repo", (c) => {
+    const caller = c.get("actor");
+    if (caller.type === "agent") {
+      return c.json({ error: "Agents cannot delete repositories" }, 403);
+    }
+    const slug = `${c.req.param("org")}/${c.req.param("repo")}`;
+    const repo = store.getRepoBySlug(slug);
+    if (!repo) return c.json({ error: `Repo '${slug}' not found` }, 404);
+    store.deleteRepo(repo.id);
+    return c.json({ ok: true });
+  });
+
+  app.post("/api/repos/:org/:repo/sync", async (c) => {
+    const caller = c.get("actor");
+    const slug = `${c.req.param("org")}/${c.req.param("repo")}`;
+    const repo = store.getRepoBySlug(slug);
+    if (!repo) return c.json({ error: `Repo '${slug}' not found` }, 404);
+
+    const upstreamToken = resolveUpstreamToken(store, repo, caller);
+    const adapter = forges.get(repo.forgeType);
+    const upstreamPrs = adapter.listOpenPrs ? await adapter.listOpenPrs(repo, upstreamToken) : [];
+
+    let imported = 0;
+    let updated = 0;
+    const syncedPrs: PullRequest[] = [];
+
+    for (const up of upstreamPrs) {
+      const existing =
+        store.getPrByUpstreamId(repo.id, up.upstreamPrId) ??
+        store.getPrByNumber(repo.id, up.number);
+
+      let pr: PullRequest;
+      if (!existing) {
+        const author = store.getOrCreateExternalHumanActor(up.authorHandle);
+        pr = store.createPr({
+          repoId: repo.id,
+          number: up.number,
+          title: up.title,
+          description: up.description,
+          sourceBranch: up.sourceBranch,
+          targetBranch: up.targetBranch,
+          headSha: up.headSha,
+          authorActorId: author.id,
+          upstreamPrId: up.upstreamPrId,
+          upstreamPrUrl: up.upstreamPrUrl,
+          autoMerge: repo.mergePolicy.defaultAutoMerge,
+          assignedAgents: [],
+        });
+        imported++;
+      } else {
+        pr = existing;
+        if (up.headSha && existing.headSha !== up.headSha) {
+          pr = store.updatePrHeadSha(existing.id, up.headSha);
+        }
+        if (existing.title !== up.title || existing.description !== up.description) {
+          pr = store.updatePrSettings(existing.id, {
+            title: up.title,
+            description: up.description,
+          });
+        }
+        if (existing.status === "closed") {
+          pr = store.markPrOpen(existing.id);
+        }
+        updated++;
+      }
+
+      if (pr.headSha) {
+        const checks = await adapter.getCommitChecks(repo, upstreamToken, pr.headSha).catch(() => []);
+        if (checks.length > 0) {
+          pr = store.updatePrCiChecks(pr.id, mergeChecks(pr.ciChecks, checks));
+        }
+      }
+      syncedPrs.push(pr);
+    }
+
+    return c.json({ ok: true, imported, updated, prs: syncedPrs });
+  });
+
   app.get("/api/repos/:org/:repo/pushes", (c) => {
     const slug = `${c.req.param("org")}/${c.req.param("repo")}`;
     const repo = store.getRepoBySlug(slug);
@@ -633,6 +821,15 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
       ...parsed.data,
     });
     return c.json({ webhook: sub }, 201);
+  });
+
+  app.delete("/api/repos/:org/:repo/webhooks/:id", (c) => {
+    const slug = `${c.req.param("org")}/${c.req.param("repo")}`;
+    const repo = store.getRepoBySlug(slug);
+    if (!repo) return c.json({ error: `Repo '${slug}' not found` }, 404);
+    const deleted = store.deleteWebhookSubscription(repo.id, c.req.param("id"));
+    if (!deleted) return c.json({ error: "Webhook subscription not found" }, 404);
+    return c.json({ ok: true });
   });
 
   app.get("/api/webhooks/deliveries", (c) => {
@@ -710,8 +907,14 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
       targetBranch,
     });
 
+    const parsedUpstreamNum =
+      shadow.upstreamPrId && /^\d+$/.test(shadow.upstreamPrId)
+        ? Number.parseInt(shadow.upstreamPrId, 10)
+        : undefined;
+
     const pr = store.createPr({
       repoId: repo.id,
+      number: parsedUpstreamNum,
       title: data.title,
       description: data.description,
       sourceBranch: data.sourceBranch,
@@ -807,6 +1010,38 @@ export function createApp(options: CreateAppOptions = {}): AgenticGitContext {
     });
 
     return c.json({ pr: closed });
+  });
+
+  app.post("/api/repos/:org/:repo/prs/:number/reopen", async (c) => {
+    const caller = c.get("actor");
+    const slug = `${c.req.param("org")}/${c.req.param("repo")}`;
+    const repo = store.getRepoBySlug(slug);
+    if (!repo) return c.json({ error: `Repo '${slug}' not found` }, 404);
+    const num = Number.parseInt(c.req.param("number"), 10);
+    const pr = store.getPrByNumber(repo.id, num);
+    if (!pr) return c.json({ error: `PR #${num} not found` }, 404);
+
+    if (pr.status === "merged") {
+      return c.json({ error: `PR #${num} is already merged and cannot be reopened` }, 409);
+    }
+    if (pr.status === "open") {
+      return c.json({ pr });
+    }
+
+    const adapter = forges.get(repo.forgeType);
+    if (pr.upstreamPrId && adapter.reopenShadowPr) {
+      const upstreamToken = resolveUpstreamToken(store, repo, caller);
+      await adapter.reopenShadowPr(repo, upstreamToken, pr.upstreamPrId);
+    }
+
+    const reopened = store.markPrOpen(pr.id);
+    await webhooks.emit(repo.id, "pr.updated", {
+      repo: store.stripRepoInternal(repo),
+      pr: reopened,
+      reopenedBy: store.stripActorInternal(caller),
+    });
+
+    return c.json({ pr: reopened });
   });
 
   // ---- Agent-Aware Filtered Diff ----

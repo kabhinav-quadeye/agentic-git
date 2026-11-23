@@ -300,6 +300,26 @@ export class Store {
     this.db.prepare(`UPDATE actors SET upstream_token = ? WHERE id = ?`).run(upstreamToken, actorId);
   }
 
+  deleteActor(actorId: string): boolean {
+    const info = this.db.prepare(`DELETE FROM actors WHERE id = ?`).run(actorId);
+    return Number(info.changes) > 0;
+  }
+
+  getOrCreateExternalHumanActor(handle: string): ActorRowInternal {
+    const sanitized = handle.replace(/[^a-zA-Z0-9._-]/g, "_") || "external-user";
+    const existing = this.getActorByHandle(sanitized);
+    if (existing) return existing;
+    const created = this.createActor({
+      handle: sanitized,
+      displayName: sanitized,
+      type: "human",
+      role: "developer",
+      canMerge: false,
+      canApprove: true,
+    });
+    return this.getActorById(created.actor.id)!;
+  }
+
   // ---- Repos ----
 
   createRepo(input: {
@@ -426,6 +446,11 @@ export class Store {
     return this.stripRepoInternal(this.getRepoById(repoId)!);
   }
 
+  deleteRepo(repoId: string): boolean {
+    const info = this.db.prepare(`DELETE FROM repos WHERE id = ?`).run(repoId);
+    return Number(info.changes) > 0;
+  }
+
   getAllCommentTypes(repo: Repo): CommentTypeDefinition[] {
     const byKey = new Map<string, CommentTypeDefinition>();
     for (const ct of BUILTIN_COMMENT_TYPES) {
@@ -441,6 +466,7 @@ export class Store {
 
   createPr(input: {
     repoId: string;
+    number?: number;
     title: string;
     description: string;
     sourceBranch: string;
@@ -454,10 +480,20 @@ export class Store {
   }): PullRequest {
     const id = newId("pr");
     const now = new Date().toISOString();
-    const maxRow = this.db
-      .prepare(`SELECT COALESCE(MAX(number), 0) AS max_num FROM pull_requests WHERE repo_id = ?`)
-      .get(input.repoId) as { max_num: number };
-    const nextNumber = Number(maxRow.max_num) + 1;
+    let prNumber: number;
+    if (
+      typeof input.number === "number" &&
+      Number.isInteger(input.number) &&
+      input.number > 0 &&
+      !this.getPrByNumber(input.repoId, input.number)
+    ) {
+      prNumber = input.number;
+    } else {
+      const maxRow = this.db
+        .prepare(`SELECT COALESCE(MAX(number), 0) AS max_num FROM pull_requests WHERE repo_id = ?`)
+        .get(input.repoId) as { max_num: number };
+      prNumber = Number(maxRow.max_num) + 1;
+    }
 
     this.db
       .prepare(
@@ -466,7 +502,7 @@ export class Store {
       )
       .run(
         id,
-        nextNumber,
+        prNumber,
         input.repoId,
         input.title,
         input.description,
@@ -538,6 +574,13 @@ export class Store {
     const row = this.db
       .prepare(`${this.prSelectSql()} WHERE pr.repo_id = ? AND pr.number = ?`)
       .get(repoId, num) as Record<string, unknown> | undefined;
+    return row ? this.mapPrRow(row) : null;
+  }
+
+  getPrByUpstreamId(repoId: string, upstreamPrId: string): PullRequest | null {
+    const row = this.db
+      .prepare(`${this.prSelectSql()} WHERE pr.repo_id = ? AND pr.upstream_pr_id = ?`)
+      .get(repoId, upstreamPrId) as Record<string, unknown> | undefined;
     return row ? this.mapPrRow(row) : null;
   }
 
@@ -627,6 +670,14 @@ export class Store {
     const now = new Date().toISOString();
     this.db
       .prepare(`UPDATE pull_requests SET status = 'closed', updated_at = ? WHERE id = ?`)
+      .run(now, prId);
+    return this.getPrById(prId)!;
+  }
+
+  markPrOpen(prId: string): PullRequest {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(`UPDATE pull_requests SET status = 'open', updated_at = ? WHERE id = ?`)
       .run(now, prId);
     return this.getPrById(prId)!;
   }
@@ -871,6 +922,13 @@ export class Store {
       enabled: Boolean(row.enabled),
       createdAt: String(row.created_at),
     }));
+  }
+
+  deleteWebhookSubscription(repoId: string, id: string): boolean {
+    const info = this.db
+      .prepare(`DELETE FROM webhook_subscriptions WHERE repo_id = ? AND id = ?`)
+      .run(repoId, id);
+    return Number(info.changes) > 0;
   }
 
   recordWebhookDelivery(input: {

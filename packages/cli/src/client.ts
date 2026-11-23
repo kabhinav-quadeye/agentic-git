@@ -29,11 +29,19 @@ export class AgitClient {
       headers["Content-Type"] = "application/json";
     }
 
-    const res = await fetch(`${this.cfg.serverUrl}${routePath}`, {
-      method,
-      headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${this.cfg.serverUrl}${routePath}`, {
+        method,
+        headers,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Could not reach agentic-git server at ${this.cfg.serverUrl} (${reason}). Start the server or run \`agit auth login --server <url> --token <token>\`.`,
+      );
+    }
 
     const text = await res.text();
     let json: unknown = null;
